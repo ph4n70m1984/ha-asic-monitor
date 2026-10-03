@@ -20,7 +20,7 @@ async def async_setup_entry(
 ) -> None:
 	"""Настройка сенсоров."""
 	coordinator: AsicDataCoordinator = hass.data[DOMAIN][entry.entry_id]
-	known_devices = set()
+	known_devices: set[str] = set()
 
 	def check_and_add():
 		new_entities = []
@@ -31,6 +31,8 @@ async def async_setup_entry(
 					AsicHashrateSensor(coordinator, ip),
 					AsicPowerSensor(coordinator, ip),
 					AsicChipTempSensor(coordinator, ip),
+					AsicPoolUrlSensor(coordinator, ip),
+					AsicPoolUserSensor(coordinator, ip),
 				])
 		if new_entities:
 			async_add_entities(new_entities)
@@ -73,7 +75,7 @@ class AsicHashrateSensor(AsicBaseSensor):
 	@property
 	def native_value(self) -> float | None:
 		data = self.coordinator.data.get(self.ip)
-		return round(data["hashrate_th"], 2) if data else None
+		return round(data["hashrate_th"], 2) if data and "hashrate_th" in data else None
 
 class AsicPowerSensor(AsicBaseSensor):
 	_attr_name = "Power"
@@ -106,3 +108,29 @@ class AsicChipTempSensor(AsicBaseSensor):
 		if data and data.get("max_chip_temp") is not None:
 			return round(data["max_chip_temp"], 1)
 		return None
+
+class AsicPoolUrlSensor(AsicBaseSensor):
+	_attr_name = "Pool URL"
+	_attr_icon = "mdi:server-network"
+
+	@property
+	def unique_id(self) -> str:
+		return f"{self.ip}_pool_url"
+
+	@property
+	def native_value(self) -> str | None:
+		data = self.coordinator.data.get(self.ip)
+		return data.get("pool_url") if data else None
+
+class AsicPoolUserSensor(AsicBaseSensor):
+	_attr_name = "Pool Worker / User"
+	_attr_icon = "mdi:account-hard-hat"
+
+	@property
+	def unique_id(self) -> str:
+		return f"{self.ip}_pool_user"
+
+	@property
+	def native_value(self) -> str | None:
+		data = self.coordinator.data.get(self.ip)
+		return data.get("pool_user") if data else None
