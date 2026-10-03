@@ -25,6 +25,8 @@ class AsicDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 		subnets: str,
 		poll_interval: int,
 		scan_interval: int,
+		username: str = "root",
+		password: str = "admin",
 	) -> None:
 		super().__init__(
 			hass,
@@ -34,6 +36,8 @@ class AsicDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 		)
 		self.subnets = subnets
 		self.scan_interval = scan_interval
+		self.username = username
+		self.password = password
 		self.last_scan_time = 0.0
 		self.known_ips: set[str] = set()
 
@@ -53,11 +57,10 @@ class AsicDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 				break
 
 		if not self.bin_path:
-			# Дефолтный путь на случай отложенного появления файла
 			self.bin_path = os.path.join(bin_dir, "asic_scanner_amd64")
 			_LOGGER.error("ASIC Monitor: executable not found in %s", bin_dir)
 		else:
-			# Автоматически выставляем права на выполнение (chmod +x)
+			# Выставляем права на исполнение (chmod +x)
 			try:
 				st = os.stat(self.bin_path)
 				os.chmod(self.bin_path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
@@ -91,8 +94,13 @@ class AsicDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 			_LOGGER.error("Error during subnet scan: %s", err)
 
 	async def async_restart_miner(self, ip: str) -> None:
-		"""Отправка команды перезагрузки."""
-		await self._run_cmd("-cmd", "restart", "-target", ip)
+		"""Отправка команды перезагрузки с авторизацией."""
+		await self._run_cmd(
+			"-cmd", "restart",
+			"-target", ip,
+			"-user", self.username,
+			"-pass", self.password,
+		)
 
 	async def _async_update_data(self) -> dict[str, Any]:
 		"""Периодический опрос телеметрии."""
@@ -105,7 +113,12 @@ class AsicDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
 		async def poll_one(ip: str):
 			try:
-				raw = await self._run_cmd("-cmd", "poll", "-target", ip)
+				raw = await self._run_cmd(
+					"-cmd", "poll",
+					"-target", ip,
+					"-user", self.username,
+					"-pass", self.password,
+				)
 				data = json.loads(raw)
 				results[ip] = data
 			except Exception as err:

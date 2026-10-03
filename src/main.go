@@ -23,9 +23,18 @@ type Output struct {
 	CanRestart  bool     `json:"can_restart"`
 }
 
+func getEnv(key, fallback string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return fallback
+}
+
 func main() {
 	cmd := flag.String("cmd", "poll", "Action: scan, poll, restart")
 	target := flag.String("target", "", "IP for poll/restart, or comma-separated subnets for scan")
+	user := flag.String("user", getEnv("ASIC_USER", "root"), "Miner RPC username")
+	pass := flag.String("pass", getEnv("ASIC_PASS", "admin"), "Miner RPC password")
 	flag.Parse()
 
 	switch *cmd {
@@ -65,6 +74,11 @@ func main() {
 		}
 		defer miner.Close()
 
+		// Авторизация для прошивок VNish / Braiins / Stock
+		if *user != "" && *pass != "" {
+			_ = miner.SetAuth(*user, *pass)
+		}
+
 		data, err := miner.GetData()
 		if err != nil {
 			os.Exit(2)
@@ -91,7 +105,7 @@ func main() {
 			maxTemp = &val
 		}
 
-		// Корректное чтение *PoolURL и *string
+		// Корректное чтение пулов
 		var poolURL, poolUser string
 		pools, err := miner.GetPools()
 		if err == nil && len(pools) > 0 {
@@ -132,6 +146,9 @@ func main() {
 
 		miner, err := f.GetMiner(*target)
 		if err == nil {
+			if *user != "" && *pass != "" {
+				_ = miner.SetAuth(*user, *pass)
+			}
 			_, _ = miner.Restart()
 			miner.Close()
 		}
