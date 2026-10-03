@@ -6,6 +6,7 @@ from datetime import timedelta
 import json
 import logging
 import os
+import stat
 from typing import Any
 
 from homeassistant.core import HomeAssistant
@@ -36,12 +37,38 @@ class AsicDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 		self.last_scan_time = 0.0
 		self.known_ips: set[str] = set()
 
-		# Путь к скомпилированному Go-бинарнику
+		# Автоопределение пути к бинарнику
 		component_dir = os.path.dirname(__file__)
-		self.bin_path = os.path.join(component_dir, "bin", "asic_scanner")
+		bin_dir = os.path.join(component_dir, "bin")
+
+		candidates = [
+			os.path.join(bin_dir, "asic_scanner_amd64"),
+			os.path.join(bin_dir, "asic_scanner"),
+		]
+
+		self.bin_path = None
+		for path in candidates:
+			if os.path.isfile(path):
+				self.bin_path = path
+				break
+
+		if not self.bin_path:
+			# Дефолтный путь на случай отложенного появления файла
+			self.bin_path = os.path.join(bin_dir, "asic_scanner_amd64")
+			_LOGGER.error("ASIC Monitor: executable not found in %s", bin_dir)
+		else:
+			# Автоматически выставляем права на выполнение (chmod +x)
+			try:
+				st = os.stat(self.bin_path)
+				os.chmod(self.bin_path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+			except Exception as err:
+				_LOGGER.warning("Could not set executable permissions on %s: %s", self.bin_path, err)
 
 	async def _run_cmd(self, *args: str) -> str:
 		"""Запуск вспомогательного бинарника."""
+		if not os.path.isfile(self.bin_path):
+			raise UpdateFailed(f"Scanner binary missing at: {self.bin_path}")
+
 		proc = await asyncio.create_subprocess_exec(
 			self.bin_path,
 			*args,
