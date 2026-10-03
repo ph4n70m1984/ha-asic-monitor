@@ -1,0 +1,12 @@
+{
+  "domain": "asic_monitor",
+  "name": "ASIC Monitor",
+  "codeowners": ["@ph4n70m1984"],
+  "config_flow": true,
+  "documentation": "https://github.com/ph4n70m1984/ha-asic-monitor",
+  "integration_type": "hub",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/ph4n70m1984/ha-asic-monitor/issues",
+  "requirements": [],
+  "version": "1.0.0"
+}
