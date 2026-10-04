@@ -85,37 +85,124 @@
 
 ## 🛠️ Сборка для разработчиков
 
-Для сборки `asic_scanner_amd64` требуются:
+Для сборки `asic_scanner_amd64` используется **статическая линковка musl**.
 
+### Требования
+
+- Linux x86_64
 - Go **1.23+**
 - Rust / Cargo
 - CGO
-- Linux/amd64 toolchain
+- Git
+- `build-essential`
 
-### 1. Сборка Rust FFI
+### Подготовка окружения
+
+#### 1. Установка системных утилит и Rust
 
 ```bash
-git clone --depth 1 https://github.com/256foundation/asic-rs.git /tmp/asic-rs
+sudo apt update && sudo apt install -y curl build-essential git
 
-cd /tmp/asic-rs
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
-cargo build --release -p asic-rs-ffi
+source "$HOME/.cargo/env"
+
+rustup target add x86_64-unknown-linux-musl
 ```
 
-### 2. Сборка Go-бинарника
+#### 2. Загрузка автономного musl-компилятора
 
 ```bash
-cd ha-asic-monitor/src
+cd /tmp
+
+curl -OL https://musl.cc/x86_64-linux-musl-cross.tgz
+
+tar -xf x86_64-linux-musl-cross.tgz
+```
+
+### Шаг 1. Сборка Rust FFI
+
+Клонируйте `asic-rs`:
+
+```bash
+cd /tmp
+
+git clone --depth 1 https://github.com/256foundation/asic-rs.git
+
+cd asic-rs
+```
+
+Настройте musl-компилятор:
+
+```bash
+export CC_x86_64_unknown_linux_musl=/tmp/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc
+
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=/tmp/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc
+```
+
+Соберите релизную версию:
+
+```bash
+cargo build \
+  --release \
+  --target x86_64-unknown-linux-musl \
+  -p asic-rs-ffi
+```
+
+После успешной сборки библиотека будет находиться здесь:
+
+```text
+/tmp/asic-rs/target/x86_64-unknown-linux-musl/release/libasic_rs_ffi.a
+```
+
+### Шаг 2. Сборка Go-бинарника
+
+Перейдите в каталог исходников проекта:
+
+```bash
+cd "<путь_к_проекту>/ha-asic-monitor/src"
+```
+
+Настройте CGO и musl-компилятор:
+
+```bash
+export CC=/tmp/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc
+export CXX=/tmp/x86_64-linux-musl-cross/bin/x86_64-linux-musl-g++
 
 export CGO_ENABLED=1
-export CGO_LDFLAGS="-L/tmp/asic-rs/target/release"
 
+export CGO_LDFLAGS="-L/tmp/asic-rs/target/x86_64-unknown-linux-musl/release"
+```
+
+Соберите статически связанный бинарник:
+
+```bash
 go build \
-  -ldflags="-s -w" \
-  -o ../custom_components/asic_monitor/bin/asic_scanner_amd64 \
-  main.go
+  -ldflags="-s -w -extldflags '-static'" \
+  -o ../custom_components/asic_monitor/bin/asic_scanner_amd64
+```
 
-chmod +x ../custom_components/asic_monitor/bin/asic_scanner_amd64
+Готовый бинарник:
+
+```text
+custom_components/
+└── asic_monitor/
+    └── bin/
+        └── asic_scanner_amd64
+```
+
+### Проверка
+
+Проверить полученный бинарник:
+
+```bash
+file ../custom_components/asic_monitor/bin/asic_scanner_amd64
+```
+
+Для статической сборки ожидается вывод с указанием:
+
+```text
+statically linked
 ```
 
 ---
@@ -134,7 +221,7 @@ chmod +x ../custom_components/asic_monitor/bin/asic_scanner_amd64
 
 ## 🙏 Credits
 
-Мониторинг и работа с ASIC основаны на проекте **[asic-rs](https://github.com/256foundation/asic-rs)**.
+Мониторинг и работа с ASIC основаны на проекте **[`asic-rs`](https://github.com/256foundation/asic-rs)**.
 
 ---
 
