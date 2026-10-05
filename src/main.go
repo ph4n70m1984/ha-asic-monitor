@@ -3,12 +3,14 @@ package main
 import (
 	"bufio"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -53,21 +55,54 @@ func sha256Hex(s string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// executeWhatsminerSessionCmd для стоковых WhatsMiner M6x (API 3.0.1 - 3.0.5)
-func executeWhatsminerSessionCmd(ip, password, cmd string) error {
+// isAPIGreaterOrEqual сравнивает семантические версии вида "3.0.5" и "3.0.1"
+func isAPIGreaterOrEqual(apiVer, targetVer string) bool {
+	if apiVer == "" {
+		return true // Для современных WhatsMiner без явного флага считаем >= 3.0.5
+	}
+	cleanVer := strings.TrimPrefix(apiVer, "v")
+	v1Parts := strings.Split(cleanVer, ".")
+	v2Parts := strings.Split(targetVer, ".")
+
+	maxLen := len(v1Parts)
+	if len(v2Parts) > maxLen {
+		maxLen = len(v2Parts)
+	}
+
+	for i := 0; i < maxLen; i++ {
+		var n1, n2 int
+		if i < len(v1Parts) {
+			n1, _ = strconv.Atoi(v1Parts[i])
+		}
+		if i < len(v2Parts) {
+			n2, _ = strconv.Atoi(v2Parts[i])
+		}
+		if n1 > n2 {
+			return true
+		}
+		if n1 < n2 {
+			return false
+		}
+	}
+	return true
+}
+
+// executeWhatsminerStrictCmd выполняет строгое разделение по версии API
+func executeWhatsminerStrictCmd(ip, user, password, action, apiVer string) error {
 	addr := net.JoinHostPort(ip, "4028")
-	fmt.Fprintf(os.Stderr, "[WM-SOCKET] Подключение к %s...\n", addr)
+	isModern := isAPIGreaterOrEqual(apiVer, "3.0.5")
+	fmt.Fprintf(os.Stderr, "[WM-STRICT] Подключение к %s (API: '%s', Режим modern >= 3.0.5: %t)...\n", addr, apiVer, isModern)
 
 	conn, err := net.DialTimeout("tcp", addr, 4*time.Second)
 	if err != nil {
-		return fmt.Errorf("ошибка подключения к сокету: %w", err)
+		return fmt.Errorf("ошибка подключения к сокету %s: %w", addr, err)
 	}
 	defer conn.Close()
 
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(6 * time.Second))
 	reader := bufio.NewReader(conn)
 
-	// Запрашиваем токен через {"command":"get_token"}\n
+	// Шаг 1: Запрашиваем токен
 	getTokPayload := `{"command":"get_token"}` + "\n"
 	if _, err := conn.Write([]byte(getTokPayload)); err != nil {
 		return fmt.Errorf("ошибка отправки get_token: %w", err)
@@ -106,43 +141,102 @@ func executeWhatsminerSessionCmd(ip, password, cmd string) error {
 		return fmt.Errorf("не удалось извлечь salt из ответа: %s", respStr)
 	}
 
-	pHash := sha256Hex(password)
-	tokenV2 := sha256Hex(pHash + activeSalt)
-
-	payloadMap := map[string]interface{}{
-		"cmd":   cmd,
-		"token": tokenV2,
+	account := user
+	if account == "" || account == "root" {
+		account = "admin"
 	}
+
+	var payloadMap map[string]interface{}
+	var desc string
+
+	if isModern {
+		// --- РЕЖИМ API >= 3.0.5: СТРОГО set.miner.service ---
+		var param string
+		switch action {
+		case "stop", "pause", "power_off":
+			param = "stop"
+		case "start", "resume":
+			param = "start"
+		default: // restart
+			param = "restart"
+		}
+
+		cmdName := "set.miner.service"
+		ts := time.Now().Unix()
+		concat := fmt.Sprintf("%s%s%s%d", cmdName, password, activeSalt, ts)
+		hash := sha256.Sum256([]byte(concat))
+		b64Token := base64.StdEncoding.EncodeToString(hash[:])
+		if len(b64Token) > 8 {
+			b64Token = b64Token[:8]
+		}
+
+		payloadMap = map[string]interface{}{
+			"cmd":     cmdName,
+			"ts":      ts,
+			"token":   b64Token,
+			"account": account,
+			"param":   param,
+		}
+		desc = fmt.Sprintf("set.miner.service param: %s", param)
+	} else {
+		// --- РЕЖИМ API < 3.0.5: power_off / restart ---
+		pHash := sha256Hex(password)
+		hexToken := sha256Hex(pHash + activeSalt)
+
+		var legacyCmd string
+		switch action {
+		case "stop", "pause", "power_off":
+			legacyCmd = "power_off"
+		case "start", "resume":
+			legacyCmd = "restart"
+		default: // restart
+			legacyCmd = "restart"
+		}
+
+		payloadMap = map[string]interface{}{
+			"cmd":   legacyCmd,
+			"token": hexToken,
+		}
+		desc = fmt.Sprintf("legacy %s (hex token)", legacyCmd)
+	}
+
 	payloadBytes, _ := json.Marshal(payloadMap)
 	payloadBytes = append(payloadBytes, '\n')
 
+	fmt.Fprintf(os.Stderr, "[WM-STRICT] Отправка команды [%s]: %s", desc, string(payloadBytes))
 	if _, err := conn.Write(payloadBytes); err != nil {
 		return fmt.Errorf("ошибка отправки payload: %w", err)
 	}
 
+	// Шаг 2: Чтение ответа майнера
 	_ = conn.SetDeadline(time.Now().Add(4 * time.Second))
 	resRaw, err := reader.ReadBytes('\x00')
 	if err != nil && len(resRaw) == 0 {
 		resRaw, err = reader.ReadBytes('\n')
 	}
 
+	// Разрыв соединения сокетом на WhatsMiner означает успешный перезапуск / остановку демона
 	if err != nil || len(resRaw) == 0 {
-		fmt.Fprintf(os.Stderr, "[WM-SOCKET] Сокет закрыт майнером (команда %s принята)\n", cmd)
+		fmt.Fprintf(os.Stderr, "[WM-STRICT] Сокет закрыт майнером (команда [%s] успешно выполнена!)\n", desc)
 		return nil
 	}
 
 	resStr := strings.TrimRight(string(resRaw), "\x00\r\n")
+	fmt.Fprintf(os.Stderr, "[WM-STRICT] Ответ майнера: %s\n", resStr)
+
 	var res map[string]interface{}
 	if err := json.Unmarshal([]byte(resStr), &res); err == nil {
-		status, _ := res["STATUS"].(string)
 		code, _ := res["code"].(float64)
-		if status == "S" || code == 0 || strings.Contains(strings.ToLower(resStr), "ok") || strings.Contains(strings.ToLower(resStr), "success") {
-			fmt.Fprintf(os.Stderr, "[WM-SOCKET] Команда '%s' успешно выполнена WhatsMiner!\n", cmd)
+		msg, _ := res["msg"].(string)
+		status, _ := res["STATUS"].(string)
+
+		if code == 0 || strings.EqualFold(msg, "ok") || status == "S" || strings.Contains(strings.ToLower(resStr), "success") {
+			fmt.Fprintf(os.Stderr, "[WM-STRICT] Команда [%s] подтверждена успешно!\n", desc)
 			return nil
 		}
 	}
 
-	return fmt.Errorf("майнер вернул статус ошибки: %s", resStr)
+	return fmt.Errorf("майнер отклонил команду [%s]: %s", desc, resStr)
 }
 
 func main() {
@@ -259,15 +353,19 @@ func main() {
 		_ = json.NewEncoder(os.Stdout).Encode(out)
 
 	case "pause":
-		// 1. Проверяем VNish / Braiins через нативный FFI
+		// 1. Проверяем VNish / Braiins OS через FFI
 		f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(4)
 		miner, err := f.GetMiner(*target)
 		f.Close()
 
 		handled := false
+		var apiVer string
 		if err == nil {
 			if *user != "" && *pass != "" {
 				_ = miner.SetAuth(*user, *pass)
+			}
+			if vPtr, err := miner.GetAPIVersion(); err == nil && vPtr != nil {
+				apiVer = *vPtr
 			}
 			ok, _ := miner.Pause(nil)
 			if ok {
@@ -277,24 +375,28 @@ func main() {
 			miner.Close()
 		}
 
-		// 2. Если FFI не поддержан устройством (WhatsMiner Stock)
+		// 2. Если не VNish — управляем с проверкой версии API
 		if !handled {
-			if err := executeWhatsminerSessionCmd(*target, *pass, "power_off"); err != nil {
+			if err := executeWhatsminerStrictCmd(*target, *user, *pass, "stop", apiVer); err != nil {
 				fmt.Fprintf(os.Stderr, "[ERROR] %v\n", err)
 				os.Exit(1)
 			}
 		}
 
 	case "resume":
-		// 1. Проверяем VNish / Braiins через FFI
+		// 1. Проверяем VNish / Braiins OS через FFI
 		f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(4)
 		miner, err := f.GetMiner(*target)
 		f.Close()
 
 		handled := false
+		var apiVer string
 		if err == nil {
 			if *user != "" && *pass != "" {
 				_ = miner.SetAuth(*user, *pass)
+			}
+			if vPtr, err := miner.GetAPIVersion(); err == nil && vPtr != nil {
+				apiVer = *vPtr
 			}
 			ok, _ := miner.Resume(nil)
 			if ok {
@@ -304,24 +406,28 @@ func main() {
 			miner.Close()
 		}
 
-		// 2. Фолбэк на WhatsMiner
+		// 2. WhatsMiner запуск
 		if !handled {
-			if err := executeWhatsminerSessionCmd(*target, *pass, "restart"); err != nil {
+			if err := executeWhatsminerStrictCmd(*target, *user, *pass, "start", apiVer); err != nil {
 				fmt.Fprintf(os.Stderr, "[ERROR] %v\n", err)
 				os.Exit(1)
 			}
 		}
 
 	case "restart":
-		// 1. Проверяем VNish / Braiins через FFI
+		// 1. Проверяем VNish / Braiins OS через FFI
 		f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(4)
 		miner, err := f.GetMiner(*target)
 		f.Close()
 
 		handled := false
+		var apiVer string
 		if err == nil {
 			if *user != "" && *pass != "" {
 				_ = miner.SetAuth(*user, *pass)
+			}
+			if vPtr, err := miner.GetAPIVersion(); err == nil && vPtr != nil {
+				apiVer = *vPtr
 			}
 			ok, _ := miner.Restart()
 			if ok {
@@ -331,9 +437,9 @@ func main() {
 			miner.Close()
 		}
 
-		// 2. Фолбэк на WhatsMiner
+		// 2. WhatsMiner перезапуск
 		if !handled {
-			if err := executeWhatsminerSessionCmd(*target, *pass, "reboot"); err != nil {
+			if err := executeWhatsminerStrictCmd(*target, *user, *pass, "restart", apiVer); err != nil {
 				fmt.Fprintf(os.Stderr, "[ERROR] %v\n", err)
 				os.Exit(1)
 			}
