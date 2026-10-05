@@ -7,6 +7,7 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
+import homeassistant.helpers.config_validation as cv
 
 from .const import (
 	CONF_PASSWORD,
@@ -45,11 +46,11 @@ class AsicMonitorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 		data_schema = vol.Schema(
 			{
-				vol.Required(CONF_SUBNETS, default=DEFAULT_SUBNETS): str,
-				vol.Required(CONF_USERNAME, default=DEFAULT_USERNAME): str,
-				vol.Required(CONF_PASSWORD, default=DEFAULT_PASSWORD): str,
-				vol.Required(CONF_POLL_INTERVAL, default=DEFAULT_POLL_INTERVAL): int,
-				vol.Required(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL): int,
+				vol.Required(CONF_SUBNETS, default=DEFAULT_SUBNETS): cv.string,
+				vol.Required(CONF_USERNAME, default=DEFAULT_USERNAME): cv.string,
+				vol.Required(CONF_PASSWORD, default=DEFAULT_PASSWORD): cv.string,
+				vol.Required(CONF_POLL_INTERVAL, default=DEFAULT_POLL_INTERVAL): cv.positive_int,
+				vol.Required(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL): cv.positive_int,
 			}
 		)
 
@@ -85,11 +86,26 @@ class AsicMonitorOptionsFlow(config_entries.OptionsFlow):
 
 		schema = vol.Schema(
 			{
-				vol.Required(CONF_SUBNETS, default=current.get(CONF_SUBNETS, DEFAULT_SUBNETS)): str,
-				vol.Required(CONF_USERNAME, default=current.get(CONF_USERNAME, DEFAULT_USERNAME)): str,
-				vol.Required(CONF_PASSWORD, default=current.get(CONF_PASSWORD, DEFAULT_PASSWORD)): str,
-				vol.Required(CONF_POLL_INTERVAL, default=current.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL)): int,
-				vol.Required(CONF_SCAN_INTERVAL, default=current.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)): int,
+				vol.Required(
+					CONF_SUBNETS, 
+					default=current.get(CONF_SUBNETS, DEFAULT_SUBNETS)
+				): cv.string,
+				vol.Required(
+					CONF_USERNAME, 
+					default=current.get(CONF_USERNAME, DEFAULT_USERNAME)
+				): cv.string,
+				vol.Required(
+					CONF_PASSWORD, 
+					default=current.get(CONF_PASSWORD, DEFAULT_PASSWORD)
+				): cv.string,
+				vol.Required(
+					CONF_POLL_INTERVAL, 
+					default=current.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL)
+				): cv.positive_int,
+				vol.Required(
+					CONF_SCAN_INTERVAL, 
+					default=current.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+				): cv.positive_int,
 			}
 		)
 
