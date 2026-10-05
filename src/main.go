@@ -1,13 +1,14 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
+	"crypto/aes"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -31,17 +32,6 @@ type Output struct {
 	CanRestart  bool     `json:"can_restart"`
 }
 
-type TokenMsg struct {
-	NewSalt string `json:"newsalt"`
-	Salt    string `json:"salt"`
-}
-
-type TokenResponse struct {
-	STATUS string          `json:"STATUS"`
-	Msg    json.RawMessage `json:"Msg"`
-	Code   int             `json:"Code"`
-}
-
 func getEnv(key, fallback string) string {
 	if val := os.Getenv(key); val != "" {
 		return val
@@ -49,166 +39,223 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-func sha256Hex(s string) string {
-	h := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(h[:])
+// aesEncryptPKCS7 шифрует данные AES-256-ECB со стандартным дополнением PKCS#7 (как в Rust asic-rs)
+func aesEncryptPKCS7(plain []byte, key []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	bs := block.BlockSize()
+	padLen := bs - (len(plain) % bs)
+	pad := bytes.Repeat([]byte{byte(padLen)}, padLen)
+	plain = append(plain, pad...)
+
+	cipherText := make([]byte, len(plain))
+	for start := 0; start < len(plain); start += bs {
+		block.Encrypt(cipherText[start:start+bs], plain[start:start+bs])
+	}
+	return cipherText, nil
 }
 
-// executeWhatsminerSessionCmd выполняет отправку команды строго под пользователем из HA
-func executeWhatsminerSessionCmd(ip, user, password, action string) error {
+// sendSingleTCP отправляет 1 JSON-запрос в новом TCP-соединении и читает ответ
+func sendSingleTCP(ip string, payload interface{}) (map[string]interface{}, string, error) {
 	addr := net.JoinHostPort(ip, "4028")
-	fmt.Fprintf(os.Stderr, "[WM-EXEC] Подключение к %s (user: %s, action: %s)...\n", addr, user, action)
+	conn, err := net.DialTimeout("tcp", addr, 4*time.Second)
+	if err != nil {
+		return nil, "", err
+	}
+	defer conn.Close()
 
-	pHash := sha256Hex(password)
+	_ = conn.SetDeadline(time.Now().Add(6 * time.Second))
 
-	type tryCmd struct {
-		cmd    string
-		param  string
-		useB64 bool
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, "", err
+	}
+	data = append(data, '\n')
+
+	if _, err := conn.Write(data); err != nil {
+		return nil, "", err
 	}
 
-	var candidates []tryCmd
-	if action == "stop" || action == "pause" {
-		candidates = []tryCmd{
-			{cmd: "set.miner.service", param: "stop", useB64: true},
-			{cmd: "set.power_off", param: "", useB64: true},
-			{cmd: "power_off", param: "", useB64: false},
-		}
-	} else if action == "start" || action == "resume" {
-		candidates = []tryCmd{
-			{cmd: "set.miner.service", param: "start", useB64: true},
-			{cmd: "restart", param: "", useB64: false},
-		}
-	} else {
-		candidates = []tryCmd{
-			{cmd: "set.miner.service", param: "restart", useB64: true},
-			{cmd: "restart", param: "", useB64: false},
-			{cmd: "reboot", param: "", useB64: false},
-		}
+	buf := make([]byte, 8192)
+	n, err := conn.Read(buf)
+	if err != nil && err != io.EOF {
+		return nil, "", err
+	}
+	if n == 0 {
+		return nil, "", fmt.Errorf("пустой ответ (сокет закрыт майнером)")
 	}
 
-	for _, cand := range candidates {
-		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+	respText := strings.TrimRight(string(buf[:n]), "\x00\r\n ")
+	var result map[string]interface{}
+	if err := json.Unmarshal([]byte(respText), &result); err != nil {
+		return nil, respText, fmt.Errorf("невалидный JSON: %s", respText)
+	}
+
+	return result, respText, nil
+}
+
+// getMinerSalt получает постоянный salt майнера в отдельном TCP-соединении
+func getMinerSalt(ip string) (string, error) {
+	cmds := []map[string]interface{}{
+		{"cmd": "get.device.info"},
+		{"command": "get_token"},
+		{"cmd": "get_token"},
+	}
+
+	for _, c := range cmds {
+		resp, _, err := sendSingleTCP(ip, c)
+		if err != nil || resp == nil {
+			continue
+		}
+		if status, ok := resp["STATUS"].(string); ok && status == "E" {
+			continue
+		}
+		if s, ok := resp["salt"].(string); ok && s != "" {
+			return s, nil
+		}
+		if msgMap, ok := resp["msg"].(map[string]interface{}); ok {
+			if s, ok := msgMap["salt"].(string); ok && s != "" {
+				return s, nil
+			}
+		}
+		if msgMap, ok := resp["Msg"].(map[string]interface{}); ok {
+			if s, ok := msgMap["salt"].(string); ok && s != "" {
+				return s, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("не удалось получить salt")
+}
+
+// tryAsicRsFFI пробует выполнить команду через встроенный Rust FFI (asic-rs)
+func tryAsicRsFFI(ip, user, pass, action string) bool {
+	f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(5)
+	defer f.Close()
+
+	// Пробуем: 1) с пользователем из HA, 2) с аккаунтом "super" (стандарт WhatsMiner V3 в asic-rs)
+	authPairs := []struct{ u, p string }{
+		{user, pass},
+		{"super", pass},
+		{"super", "super"},
+		{"admin", "admin"},
+	}
+
+	for _, pair := range authPairs {
+		miner, err := f.GetMiner(ip)
 		if err != nil {
-			continue
+			return false
 		}
 
-		_ = conn.SetDeadline(time.Now().Add(4 * time.Second))
-		reader := bufio.NewReader(conn)
-
-		// 1. Запрос salt
-		if _, err := conn.Write([]byte("{\"command\":\"get_token\"}\n")); err != nil {
-			conn.Close()
-			continue
+		if pair.u != "" {
+			_ = miner.SetAuth(pair.u, pair.p)
 		}
 
-		rawResp, err := reader.ReadBytes('\x00')
-		if err != nil && len(rawResp) == 0 {
-			rawResp, err = reader.ReadBytes('\n')
+		var ok bool
+		var callErr error
+		switch action {
+		case "stop":
+			ok, callErr = miner.Pause(nil)
+		case "start":
+			ok, callErr = miner.Resume(nil)
+		case "restart":
+			ok, callErr = miner.Restart()
 		}
-		if err != nil || len(rawResp) == 0 {
-			conn.Close()
-			continue
+		miner.Close()
+
+		fmt.Fprintf(os.Stderr, "[FFI-TRY] user=%s, action=%s -> ok=%t, err=%v\n", pair.u, action, ok, callErr)
+		if ok {
+			return true
 		}
+	}
+	return false
+}
 
-		respStr := strings.TrimRight(string(rawResp), "\x00\r\n")
-		var tokResp TokenResponse
-		if err := json.Unmarshal([]byte(respStr), &tokResp); err != nil {
-			conn.Close()
-			continue
-		}
+// executeWhatsminerV3Direct повторяет логику asic-rs WhatsMinerV3::send_command на чистых TCP-сессиях
+func executeWhatsminerV3Direct(ip, user, password, action string) error {
+	salt, err := getMinerSalt(ip)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "[WM-V3] Получен постоянный salt: %s\n", salt)
 
-		var activeSalt string
-		var msgObj TokenMsg
-		if err := json.Unmarshal(tokResp.Msg, &msgObj); err == nil {
-			activeSalt = msgObj.NewSalt
-			if activeSalt == "" {
-				activeSalt = msgObj.Salt
-			}
-		}
-		if activeSalt == "" {
-			var plainStr string
-			if err := json.Unmarshal(tokResp.Msg, &plainStr); err == nil {
-				activeSalt = plainStr
-			}
-		}
-		if activeSalt == "" {
-			conn.Close()
-			continue
-		}
+	cmdName := "set.miner.service"
 
-		var payloadBytes []byte
-		var desc string
+	// В asic-rs указано: if issues are found with "stop"/"start", switch to "disable"/"enable"
+	var paramsToTry []string
+	if action == "stop" {
+		paramsToTry = []string{"stop", "disable"}
+	} else if action == "start" {
+		paramsToTry = []string{"start", "enable"}
+	} else {
+		paramsToTry = []string{"restart"}
+	}
 
-		if cand.useB64 {
-			// Формула MicroBT modern: Base64(SHA256(cmd + p_hash + salt + ts))[:8]
-			ts := time.Now().Unix()
-			concat := fmt.Sprintf("%s%s%s%d", cand.cmd, pHash, activeSalt, ts)
-			h := sha256.Sum256([]byte(concat))
-			b64Token := base64.StdEncoding.EncodeToString(h[:])
-			if len(b64Token) > 8 {
-				b64Token = b64Token[:8]
-			}
+	accounts := []string{user}
+	if user != "super" {
+		accounts = append(accounts, "super")
+	}
 
-			reqMap := map[string]interface{}{
-				"cmd":     cand.cmd,
-				"ts":      ts,
-				"token":   b64Token,
-				"account": user,
-			}
-			if cand.param != "" {
-				reqMap["param"] = cand.param
-			}
-			payloadBytes, _ = json.Marshal(reqMap)
-			desc = fmt.Sprintf("%s (user=%s, b64)", cand.cmd, user)
-		} else {
-			// Формула MicroBT legacy: SHA256(p_hash + salt)
-			tokenHex := sha256Hex(pHash + activeSalt)
-			reqMap := map[string]interface{}{
-				"cmd":   cand.cmd,
-				"token": tokenHex,
-			}
-			payloadBytes, _ = json.Marshal(reqMap)
-			desc = fmt.Sprintf("%s (hex)", cand.cmd)
-		}
+	for _, acc := range accounts {
+		for _, pStr := range paramsToTry {
+			// Пробуем 3 режима кодирования param:
+			// 0 = открытая строка "stop"
+			// 1 = PKCS7 AES от сырой строки "stop"
+			// 2 = PKCS7 AES от JSON-строки "\"stop\"" (как Some(json!("stop")) в asic-rs)
+			for mode := 0; mode <= 2; mode++ {
+				ts := time.Now().Unix()
+				strToHash := fmt.Sprintf("%s%s%s%d", cmdName, password, salt, ts)
+				sha256Data := sha256.Sum256([]byte(strToHash))
+				token := base64.StdEncoding.EncodeToString(sha256Data[:])[:8]
 
-		payloadBytes = append(payloadBytes, '\n')
-		fmt.Fprintf(os.Stderr, "[WM-EXEC] Отправка payload [%s]: %s", desc, string(payloadBytes))
+				var finalParam string
+				switch mode {
+				case 0:
+					finalParam = pStr
+				case 1:
+					enc, _ := aesEncryptPKCS7([]byte(pStr), sha256Data[:])
+					finalParam = base64.StdEncoding.EncodeToString(enc)
+				case 2:
+					jsonBytes, _ := json.Marshal(pStr) // "\"stop\""
+					enc, _ := aesEncryptPKCS7(jsonBytes, sha256Data[:])
+					finalParam = base64.StdEncoding.EncodeToString(enc)
+				}
 
-		if _, err := conn.Write(payloadBytes); err != nil {
-			conn.Close()
-			continue
-		}
+				payload := map[string]interface{}{
+					"cmd":     cmdName,
+					"ts":      ts,
+					"token":   token,
+					"account": acc,
+					"param":   finalParam,
+				}
 
-		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
-		resRaw, err := reader.ReadBytes('\x00')
-		if err != nil && len(resRaw) == 0 {
-			resRaw, err = reader.ReadBytes('\n')
-		}
-		conn.Close()
+				pBytes, _ := json.Marshal(payload)
+				fmt.Fprintf(os.Stderr, "[WM-V3] Отправка (acc=%s, param=%s, mode=%d): %s\n", acc, pStr, mode, string(pBytes))
 
-		if err != nil && len(resRaw) == 0 {
-			fmt.Fprintf(os.Stderr, "[WM-EXEC] Сброс сокета на [%s]\n", desc)
-			continue
-		}
+				resp, rawStr, err := sendSingleTCP(ip, payload)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "[WM-V3] Ответ (acc=%s, mode=%d): %v\n", acc, mode, err)
+					time.Sleep(150 * time.Millisecond)
+					continue
+				}
 
-		cmdRespStr := strings.TrimRight(string(resRaw), "\x00\r\n")
-		fmt.Fprintf(os.Stderr, "[WM-EXEC] Ответ майнера: %s\n", cmdRespStr)
+				fmt.Fprintf(os.Stderr, "[WM-V3] Ответ майнера: %s\n", rawStr)
 
-		var res map[string]interface{}
-		if err := json.Unmarshal([]byte(cmdRespStr), &res); err == nil {
-			code, _ := res["code"].(float64)
-			msg, _ := res["msg"].(string)
-			status, _ := res["STATUS"].(string)
+				code, hasCode := resp["code"].(float64)
+				status, _ := resp["STATUS"].(string)
+				msg, _ := resp["msg"].(string)
 
-			if code == 0 || strings.EqualFold(msg, "ok") || status == "S" || strings.Contains(strings.ToLower(cmdRespStr), "success") {
-				fmt.Fprintf(os.Stderr, "[WM-EXEC] Команда [%s] успешно подтверждена майнером!\n", desc)
-				return nil
+				if (hasCode && code == 0) || status == "S" || strings.EqualFold(msg, "ok") {
+					fmt.Fprintf(os.Stderr, "[WM-V3] УСПЕХ! Команда подтверждена майнером!\n")
+					return nil
+				}
+				time.Sleep(150 * time.Millisecond)
 			}
 		}
 	}
 
-	return fmt.Errorf("майнер отклонил команду для пользователя '%s' (действие: %s)", user, action)
+	return fmt.Errorf("все комбинации set.miner.service отклонены майнером")
 }
 
 func main() {
@@ -325,77 +372,24 @@ func main() {
 		_ = json.NewEncoder(os.Stdout).Encode(out)
 
 	case "pause":
-		// 1. Проверяем VNish / Braiins OS через FFI[cite: 7]
-		f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(4)
-		miner, err := f.GetMiner(*target)
-		f.Close()
-
-		handled := false
-		if err == nil {
-			if *user != "" && *pass != "" {
-				_ = miner.SetAuth(*user, *pass)
-			}
-			ok, _ := miner.Pause(nil)
-			if ok {
-				fmt.Fprintf(os.Stderr, "[FFI] Пауза успешно выполнена через asic-rs (VNish/Braiins)\n")
-				handled = true
-			}
-			miner.Close()
-		}
-
-		// 2. WhatsMiner строго под переданной парой user:pass
-		if !handled {
-			if err := executeWhatsminerSessionCmd(*target, *user, *pass, "stop"); err != nil {
+		if !tryAsicRsFFI(*target, *user, *pass, "stop") {
+			if err := executeWhatsminerV3Direct(*target, *user, *pass, "stop"); err != nil {
 				fmt.Fprintf(os.Stderr, "[ERROR] %v\n", err)
 				os.Exit(1)
 			}
 		}
 
 	case "resume":
-		f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(4)
-		miner, err := f.GetMiner(*target)
-		f.Close()
-
-		handled := false
-		if err == nil {
-			if *user != "" && *pass != "" {
-				_ = miner.SetAuth(*user, *pass)
-			}
-			ok, _ := miner.Resume(nil)
-			if ok {
-				fmt.Fprintf(os.Stderr, "[FFI] Запуск успешно выполнен через asic-rs (VNish/Braiins)\n")
-				handled = true
-			}
-			miner.Close()
-		}
-
-		if !handled {
-			if err := executeWhatsminerSessionCmd(*target, *user, *pass, "start"); err != nil {
+		if !tryAsicRsFFI(*target, *user, *pass, "start") {
+			if err := executeWhatsminerV3Direct(*target, *user, *pass, "start"); err != nil {
 				fmt.Fprintf(os.Stderr, "[ERROR] %v\n", err)
 				os.Exit(1)
 			}
 		}
 
 	case "restart":
-		f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(4)
-		miner, err := f.GetMiner(*target)
-		f.Close()
-
-		handled := false
-		if err == nil {
-			if *user != "" && *pass != "" {
-				_ = miner.SetAuth(*user, *pass)
-			}
-			ok, _ := miner.Restart()
-			if ok {
-				fmt.Fprintf(os.Stderr, "[FFI] Перезагрузка успешно выполнена через asic-rs (VNish/Braiins)\n")
-				handled = true
-			}
-			miner.Close()
-		}
-
-		if !handled {
-			if err := executeWhatsminerSessionCmd(*target, *user, *pass, "restart"); err != nil {
+		if !tryAsicRsFFI(*target, *user, *pass, "restart") {
+			if err := executeWhatsminerV3Direct(*target, *user, *pass, "restart"); err != nil {
 				fmt.Fprintf(os.Stderr, "[ERROR] %v\n", err)
 				os.Exit(1)
 			}
