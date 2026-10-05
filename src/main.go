@@ -32,6 +32,7 @@ type Output struct {
 type TokenResp struct {
 	STATUS string `json:"STATUS"`
 	Msg    string `json:"Msg"`
+	Code   int    `json:"Code"`
 }
 
 func getEnv(key, fallback string) string {
@@ -41,11 +42,18 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
+func sha256Hex(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])
+}
+
 // sendPrivilegedWhatsminerCmd выполняет авторизацию через get_token и отправляет привилегированную команду
 func sendPrivilegedWhatsminerCmd(ip, user, password, cmd string) error {
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, "4028"), 5*time.Second)
+	addr := net.JoinHostPort(ip, "4028")
+	conn, err := net.DialTimeout("tcp", addr, 4*time.Second)
 	if err != nil {
-		return fmt.Errorf("connect error: %w", err)
+		fmt.Fprintf(os.Stderr, "[WM-RPC] Connect error to %s: %v\n", addr, err)
+		return err
 	}
 	defer conn.Close()
 
@@ -54,71 +62,87 @@ func sendPrivilegedWhatsminerCmd(ip, user, password, cmd string) error {
 
 	// Шаг 1: Запрашиваем токен
 	if _, err := conn.Write([]byte(`{"cmd":"get_token"}` + "\n")); err != nil {
-		return fmt.Errorf("failed to request token: %w", err)
+		fmt.Fprintf(os.Stderr, "[WM-RPC] Failed to request token: %v\n", err)
+		return err
 	}
 
 	line, err := reader.ReadBytes('\x00')
 	if err != nil {
-		// Некоторые версии WhatsMiner завершают ответ переходом строки \n, а не null-byte
 		line, err = reader.ReadBytes('\n')
 		if err != nil {
-			return fmt.Errorf("failed to read token response: %w", err)
+			fmt.Fprintf(os.Stderr, "[WM-RPC] Failed to read token: %v\n", err)
+			return err
 		}
 	}
 
-	var tResp TokenResp
 	cleanLine := strings.TrimRight(string(line), "\x00\r\n")
+	var tResp TokenResp
 	if err := json.Unmarshal([]byte(cleanLine), &tResp); err != nil {
-		return fmt.Errorf("failed to parse token response: %w", err)
+		fmt.Fprintf(os.Stderr, "[WM-RPC] Token parse error: %v (raw: %s)\n", err, cleanLine)
+		return err
 	}
 
 	token := tResp.Msg
-	if token == "" {
-		return fmt.Errorf("empty token received from miner")
+	if token == "" || tResp.STATUS != "S" {
+		fmt.Fprintf(os.Stderr, "[WM-RPC] Invalid token response: %s\n", cleanLine)
+		return fmt.Errorf("token rejected: %s", cleanLine)
 	}
 
-	// Шаг 2: Расчет SHA-256 подписи
-	// WhatsMiner протокол: sha256(password + token)
-	h := sha256.New()
-	h.Write([]byte(password + token))
-	sign := hex.EncodeToString(h.Sum(nil))
+	fmt.Fprintf(os.Stderr, "[WM-RPC] Received token: %s\n", token)
 
-	// Шаг 3: Отправка привилегированной команды
-	req := map[string]string{
-		"cmd":   cmd,
-		"token": token,
-		"sign":  sign,
-	}
-	reqBytes, _ := json.Marshal(req)
-	reqBytes = append(reqBytes, '\n')
-
-	if _, err := conn.Write(reqBytes); err != nil {
-		return fmt.Errorf("failed to send privileged command: %w", err)
+	// Варианты подписей, встречающиеся в прошивках WhatsMiner:
+	// 1) sha256(password + token)
+	// 2) sha256(admin + password + token)
+	// 3) sha256(admin + ":" + password + ":" + token)
+	candidates := []struct {
+		desc string
+		sign string
+	}{
+		{"sha256(password+token)", sha256Hex(password + token)},
+		{"sha256(user+password+token)", sha256Hex(user + password + token)},
+		{"sha256(admin+password+token)", sha256Hex("admin" + password + token)},
+		{"sha256(admin:password:token)", sha256Hex("admin:" + password + ":" + token)},
 	}
 
-	// Читаем подтверждение выполнения
-	respLine, _ := reader.ReadBytes('\n')
-	if len(respLine) > 0 {
+	for _, cand := range candidates {
+		// Формируем запрос
+		req := map[string]interface{}{
+			"cmd":   cmd,
+			"token": token,
+			"sign":  cand.sign,
+		}
+		reqBytes, _ := json.Marshal(req)
+		reqBytes = append(reqBytes, '\n')
+
+		if _, err := conn.Write(reqBytes); err != nil {
+			fmt.Fprintf(os.Stderr, "[WM-RPC] Write error: %v\n", err)
+			return err
+		}
+
+		respLine, err := reader.ReadBytes('\n')
+		if err != nil && len(respLine) == 0 {
+			respLine, err = reader.ReadBytes('\x00')
+		}
+
+		respStr := strings.TrimRight(string(respLine), "\x00\r\n")
+		fmt.Fprintf(os.Stderr, "[WM-RPC] Try %s -> Response: %s\n", cand.desc, respStr)
+
 		var res map[string]interface{}
-		_ = json.Unmarshal(respLine, &res)
-		// Если статус F (Failed), пробуем альтернативную схему sha256(user + password + token)
-		if status, ok := res["STATUS"].(string); ok && status == "F" {
-			h2 := sha256.New()
-			h2.Write([]byte(user + password + token))
-			req["sign"] = hex.EncodeToString(h2.Sum(nil))
-			reqBytes2, _ := json.Marshal(req)
-			reqBytes2 = append(reqBytes2, '\n')
-			_, _ = conn.Write(reqBytes2)
+		if err := json.Unmarshal([]byte(respStr), &res); err == nil {
+			if status, ok := res["STATUS"].(string); ok && status == "S" {
+				fmt.Fprintf(os.Stderr, "[WM-RPC] Command '%s' SUCCESS!\n", cmd)
+				return nil
+			}
 		}
 	}
 
-	return nil
+	return fmt.Errorf("all auth attempts rejected by %s", ip)
 }
 
 func main() {
 	cmd := flag.String("cmd", "poll", "Action: scan, poll, restart, pause, resume")
 	target := flag.String("target", "", "IP for poll/restart/pause/resume, or subnets for scan")
-	user := flag.String("user", getEnv("ASIC_USER", "root"), "Miner RPC username")
+	user := flag.String("user", getEnv("ASIC_USER", "admin"), "Miner RPC username")
 	pass := flag.String("pass", getEnv("ASIC_PASS", "admin"), "Miner RPC password")
 	flag.Parse()
 
@@ -238,7 +262,7 @@ func main() {
 		}
 
 	case "pause":
-		// Приостановка майнинга (выключение плат хэширования)
+		// Пробуем через FFI asic-rs
 		f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(8)
 		defer f.Close()
 
@@ -253,13 +277,12 @@ func main() {
 			miner.Close()
 		}
 
-		// Если FFI-метод не отработал (сток WhatsMiner), вызываем привилегированный power_off
+		// Если FFI Pause вернул false (WhatsMiner Stock), вызываем команду power_off
 		if !handled {
 			_ = sendPrivilegedWhatsminerCmd(*target, *user, *pass, "power_off")
 		}
 
 	case "resume":
-		// Возобновление майнинга
 		f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(8)
 		defer f.Close()
 
@@ -274,7 +297,7 @@ func main() {
 			miner.Close()
 		}
 
-		// Для стока WhatsMiner возврат в работу делается через рестарт btminer сервиса
+		// Для возобновления на стоке WhatsMiner используется команда restart майнинг-демона
 		if !handled {
 			_ = sendPrivilegedWhatsminerCmd(*target, *user, *pass, "restart")
 		}
