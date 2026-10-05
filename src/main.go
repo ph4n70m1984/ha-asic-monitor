@@ -2,6 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -55,10 +58,28 @@ func sha256Hex(s string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// isAPIGreaterOrEqual сравнивает семантические версии вида "3.0.5" и "3.0.1"
+func pkcs7Padding(data []byte, blockSize int) []byte {
+	padding := blockSize - len(data)%blockSize
+	padtext := bytes.Repeat([]byte{byte(padding)}, padding)
+	return append(data, padtext...)
+}
+
+func encryptParam(plainText string, aesKey []byte) (string, error) {
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return "", err
+	}
+	padded := pkcs7Padding([]byte(plainText), aes.BlockSize)
+	ciphertext := make([]byte, len(padded))
+	iv := make([]byte, aes.BlockSize)
+	mode := cipher.NewCBCEncrypter(block, iv)
+	mode.CryptBlocks(ciphertext, padded)
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
+}
+
 func isAPIGreaterOrEqual(apiVer, targetVer string) bool {
 	if apiVer == "" {
-		return true // Для современных WhatsMiner без явного флага считаем >= 3.0.5
+		return true
 	}
 	cleanVer := strings.TrimPrefix(apiVer, "v")
 	v1Parts := strings.Split(cleanVer, ".")
@@ -87,156 +108,184 @@ func isAPIGreaterOrEqual(apiVer, targetVer string) bool {
 	return true
 }
 
-// executeWhatsminerStrictCmd выполняет строгое разделение по версии API
-func executeWhatsminerStrictCmd(ip, user, password, action, apiVer string) error {
+func executeWhatsminerStrictControl(ip, user, password, action, apiVer string) error {
 	addr := net.JoinHostPort(ip, "4028")
 	isModern := isAPIGreaterOrEqual(apiVer, "3.0.5")
 	fmt.Fprintf(os.Stderr, "[WM-STRICT] Подключение к %s (API: '%s', Режим modern >= 3.0.5: %t)...\n", addr, apiVer, isModern)
-
-	conn, err := net.DialTimeout("tcp", addr, 4*time.Second)
-	if err != nil {
-		return fmt.Errorf("ошибка подключения к сокету %s: %w", addr, err)
-	}
-	defer conn.Close()
-
-	_ = conn.SetDeadline(time.Now().Add(6 * time.Second))
-	reader := bufio.NewReader(conn)
-
-	// Шаг 1: Запрашиваем токен
-	getTokPayload := `{"command":"get_token"}` + "\n"
-	if _, err := conn.Write([]byte(getTokPayload)); err != nil {
-		return fmt.Errorf("ошибка отправки get_token: %w", err)
-	}
-
-	rawResp, err := reader.ReadBytes('\x00')
-	if err != nil && len(rawResp) == 0 {
-		rawResp, err = reader.ReadBytes('\n')
-		if err != nil {
-			return fmt.Errorf("ошибка чтения ответа get_token: %w", err)
-		}
-	}
-
-	respStr := strings.TrimRight(string(rawResp), "\x00\r\n")
-	var tokResp TokenResponse
-	if err := json.Unmarshal([]byte(respStr), &tokResp); err != nil {
-		return fmt.Errorf("ошибка парсинга json get_token: %w", err)
-	}
-
-	var activeSalt string
-	var msgObj TokenMsg
-	if err := json.Unmarshal(tokResp.Msg, &msgObj); err == nil {
-		if msgObj.NewSalt != "" {
-			activeSalt = msgObj.NewSalt
-		} else if msgObj.Salt != "" {
-			activeSalt = msgObj.Salt
-		}
-	}
-	if activeSalt == "" {
-		var plainStr string
-		if err := json.Unmarshal(tokResp.Msg, &plainStr); err == nil {
-			activeSalt = plainStr
-		}
-	}
-	if activeSalt == "" {
-		return fmt.Errorf("не удалось извлечь salt из ответа: %s", respStr)
-	}
 
 	account := user
 	if account == "" || account == "root" {
 		account = "admin"
 	}
 
-	var payloadMap map[string]interface{}
-	var desc string
+	// Список команд кандидатов для выполнения
+	type targetCmd struct {
+		cmd      string
+		rawParam string
+		useAES   bool
+	}
 
+	var targets []targetCmd
 	if isModern {
-		// --- РЕЖИМ API >= 3.0.5: СТРОГО set.miner.service ---
-		var param string
-		switch action {
-		case "stop", "pause", "power_off":
-			param = "stop"
-		case "start", "resume":
-			param = "start"
-		default: // restart
-			param = "restart"
+		if action == "stop" || action == "pause" || action == "power_off" {
+			targets = []targetCmd{
+				{cmd: "set.power_off", rawParam: "", useAES: false},
+				{cmd: "set.miner.power_off", rawParam: "", useAES: false},
+				{cmd: "set.miner.service", rawParam: "stop", useAES: false},
+				{cmd: "set.miner.service", rawParam: `"stop"`, useAES: true},
+				{cmd: "set.miner.power", rawParam: `"off"`, useAES: true},
+			}
+		} else if action == "start" || action == "resume" {
+			targets = []targetCmd{
+				{cmd: "set.miner.service", rawParam: "start", useAES: false},
+				{cmd: "set.miner.service", rawParam: `"start"`, useAES: true},
+				{cmd: "set.miner.power_on", rawParam: "", useAES: false},
+				{cmd: "set.miner.power", rawParam: `"on"`, useAES: true},
+			}
+		} else { // restart
+			targets = []targetCmd{
+				{cmd: "set.miner.service", rawParam: "restart", useAES: false},
+				{cmd: "set.miner.service", rawParam: `"restart"`, useAES: true},
+				{cmd: "set.miner.restart", rawParam: "", useAES: false},
+			}
 		}
-
-		cmdName := "set.miner.service"
-		ts := time.Now().Unix()
-		concat := fmt.Sprintf("%s%s%s%d", cmdName, password, activeSalt, ts)
-		hash := sha256.Sum256([]byte(concat))
-		b64Token := base64.StdEncoding.EncodeToString(hash[:])
-		if len(b64Token) > 8 {
-			b64Token = b64Token[:8]
-		}
-
-		payloadMap = map[string]interface{}{
-			"cmd":     cmdName,
-			"ts":      ts,
-			"token":   b64Token,
-			"account": account,
-			"param":   param,
-		}
-		desc = fmt.Sprintf("set.miner.service param: %s", param)
 	} else {
-		// --- РЕЖИМ API < 3.0.5: power_off / restart ---
-		pHash := sha256Hex(password)
-		hexToken := sha256Hex(pHash + activeSalt)
-
-		var legacyCmd string
-		switch action {
-		case "stop", "pause", "power_off":
-			legacyCmd = "power_off"
-		case "start", "resume":
-			legacyCmd = "restart"
-		default: // restart
+		// API < 3.0.5
+		legacyCmd := "power_off"
+		if action == "start" || action == "resume" || action == "restart" {
 			legacyCmd = "restart"
 		}
-
-		payloadMap = map[string]interface{}{
-			"cmd":   legacyCmd,
-			"token": hexToken,
-		}
-		desc = fmt.Sprintf("legacy %s (hex token)", legacyCmd)
-	}
-
-	payloadBytes, _ := json.Marshal(payloadMap)
-	payloadBytes = append(payloadBytes, '\n')
-
-	fmt.Fprintf(os.Stderr, "[WM-STRICT] Отправка команды [%s]: %s", desc, string(payloadBytes))
-	if _, err := conn.Write(payloadBytes); err != nil {
-		return fmt.Errorf("ошибка отправки payload: %w", err)
-	}
-
-	// Шаг 2: Чтение ответа майнера
-	_ = conn.SetDeadline(time.Now().Add(4 * time.Second))
-	resRaw, err := reader.ReadBytes('\x00')
-	if err != nil && len(resRaw) == 0 {
-		resRaw, err = reader.ReadBytes('\n')
-	}
-
-	// Разрыв соединения сокетом на WhatsMiner означает успешный перезапуск / остановку демона
-	if err != nil || len(resRaw) == 0 {
-		fmt.Fprintf(os.Stderr, "[WM-STRICT] Сокет закрыт майнером (команда [%s] успешно выполнена!)\n", desc)
-		return nil
-	}
-
-	resStr := strings.TrimRight(string(resRaw), "\x00\r\n")
-	fmt.Fprintf(os.Stderr, "[WM-STRICT] Ответ майнера: %s\n", resStr)
-
-	var res map[string]interface{}
-	if err := json.Unmarshal([]byte(resStr), &res); err == nil {
-		code, _ := res["code"].(float64)
-		msg, _ := res["msg"].(string)
-		status, _ := res["STATUS"].(string)
-
-		if code == 0 || strings.EqualFold(msg, "ok") || status == "S" || strings.Contains(strings.ToLower(resStr), "success") {
-			fmt.Fprintf(os.Stderr, "[WM-STRICT] Команда [%s] подтверждена успешно!\n", desc)
-			return nil
+		targets = []targetCmd{
+			{cmd: legacyCmd, rawParam: "", useAES: false},
 		}
 	}
 
-	return fmt.Errorf("майнер отклонил команду [%s]: %s", desc, resStr)
+	for _, tc := range targets {
+		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+		if err != nil {
+			continue
+		}
+		_ = conn.SetDeadline(time.Now().Add(4 * time.Second))
+		reader := bufio.NewReader(conn)
+
+		// 1. Запрашиваем токен
+		if _, err := conn.Write([]byte("{\"command\":\"get_token\"}\n")); err != nil {
+			conn.Close()
+			continue
+		}
+
+		rawResp, err := reader.ReadBytes('\x00')
+		if err != nil && len(rawResp) == 0 {
+			rawResp, err = reader.ReadBytes('\n')
+		}
+		if err != nil || len(rawResp) == 0 {
+			conn.Close()
+			continue
+		}
+
+		respStr := strings.TrimRight(string(rawResp), "\x00\r\n")
+		var tokResp TokenResponse
+		if err := json.Unmarshal([]byte(respStr), &tokResp); err != nil {
+			conn.Close()
+			continue
+		}
+
+		var activeSalt string
+		var msgObj TokenMsg
+		if err := json.Unmarshal(tokResp.Msg, &msgObj); err == nil {
+			if msgObj.NewSalt != "" {
+				activeSalt = msgObj.NewSalt
+			} else if msgObj.Salt != "" {
+				activeSalt = msgObj.Salt
+			}
+		}
+		if activeSalt == "" {
+			var plainStr string
+			if err := json.Unmarshal(tokResp.Msg, &plainStr); err == nil {
+				activeSalt = plainStr
+			}
+		}
+		if activeSalt == "" {
+			conn.Close()
+			continue
+		}
+
+		var payloadBytes []byte
+		if isModern {
+			ts := time.Now().Unix()
+			concat := fmt.Sprintf("%s%s%s%d", tc.cmd, password, activeSalt, ts)
+			shaKey := sha256.Sum256([]byte(concat))
+
+			b64Token := base64.StdEncoding.EncodeToString(shaKey[:])
+			if len(b64Token) > 8 {
+				b64Token = b64Token[:8]
+			}
+
+			reqMap := map[string]interface{}{
+				"cmd":     tc.cmd,
+				"account": account,
+				"ts":      ts,
+				"token":   b64Token,
+			}
+
+			if tc.rawParam != "" {
+				if tc.useAES {
+					encParam, err := encryptParam(tc.rawParam, shaKey[:])
+					if err != nil {
+						conn.Close()
+						continue
+					}
+					reqMap["param"] = encParam
+				} else {
+					reqMap["param"] = tc.rawParam
+				}
+			}
+			payloadBytes, _ = json.Marshal(reqMap)
+		} else {
+			pHash := sha256Hex(password)
+			hexToken := sha256Hex(pHash + activeSalt)
+			payloadBytes, _ = json.Marshal(map[string]interface{}{
+				"cmd":   tc.cmd,
+				"token": hexToken,
+			})
+		}
+		payloadBytes = append(payloadBytes, '\n')
+
+		fmt.Fprintf(os.Stderr, "[WM-STRICT] Пробуем команду '%s' (useAES=%t): %s", tc.cmd, tc.useAES, string(payloadBytes))
+		if _, err := conn.Write(payloadBytes); err != nil {
+			conn.Close()
+			continue
+		}
+
+		_ = conn.SetDeadline(time.Now().Add(4 * time.Second))
+		resRaw, err := reader.ReadBytes('\x00')
+		if err != nil && len(resRaw) == 0 {
+			resRaw, err = reader.ReadBytes('\n')
+		}
+		conn.Close()
+
+		if err != nil || len(resRaw) == 0 {
+			fmt.Fprintf(os.Stderr, "[WM-STRICT] Команда '%s' сбросила сокет (отклонена майнером)\n", tc.cmd)
+			continue
+		}
+
+		cmdRespStr := strings.TrimRight(string(resRaw), "\x00\r\n")
+		fmt.Fprintf(os.Stderr, "[WM-STRICT] Ответ майнера: %s\n", cmdRespStr)
+
+		var res map[string]interface{}
+		if err := json.Unmarshal([]byte(cmdRespStr), &res); err == nil {
+			code, _ := res["code"].(float64)
+			msg, _ := res["msg"].(string)
+			status, _ := res["STATUS"].(string)
+
+			if code == 0 || strings.EqualFold(msg, "ok") || status == "S" || strings.Contains(strings.ToLower(cmdRespStr), "success") {
+				fmt.Fprintf(os.Stderr, "[WM-STRICT] Команда '%s' успешно принята и подтверждена майнером!\n", tc.cmd)
+				return nil
+			}
+		}
+	}
+
+	return fmt.Errorf("майнер отклонил все варианты команд управления для API %s", apiVer)
 }
 
 func main() {
@@ -375,16 +424,15 @@ func main() {
 			miner.Close()
 		}
 
-		// 2. Если не VNish — управляем с проверкой версии API
+		// 2. WhatsMiner строго по версии API
 		if !handled {
-			if err := executeWhatsminerStrictCmd(*target, *user, *pass, "stop", apiVer); err != nil {
+			if err := executeWhatsminerStrictControl(*target, *user, *pass, "stop", apiVer); err != nil {
 				fmt.Fprintf(os.Stderr, "[ERROR] %v\n", err)
 				os.Exit(1)
 			}
 		}
 
 	case "resume":
-		// 1. Проверяем VNish / Braiins OS через FFI
 		f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(4)
 		miner, err := f.GetMiner(*target)
 		f.Close()
@@ -406,16 +454,14 @@ func main() {
 			miner.Close()
 		}
 
-		// 2. WhatsMiner запуск
 		if !handled {
-			if err := executeWhatsminerStrictCmd(*target, *user, *pass, "start", apiVer); err != nil {
+			if err := executeWhatsminerStrictControl(*target, *user, *pass, "start", apiVer); err != nil {
 				fmt.Fprintf(os.Stderr, "[ERROR] %v\n", err)
 				os.Exit(1)
 			}
 		}
 
 	case "restart":
-		// 1. Проверяем VNish / Braiins OS через FFI
 		f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(4)
 		miner, err := f.GetMiner(*target)
 		f.Close()
@@ -431,15 +477,14 @@ func main() {
 			}
 			ok, _ := miner.Restart()
 			if ok {
-				fmt.Fprintf(os.Stderr, "[FFI] Перезагрузка успешно выполнена через asic-rs (VNish/Braiins)\n")
+				fmt.Fprintf(os.Stderr, "[FFI] Рестарт успешно выполнен через asic-rs (VNish/Braiins)\n")
 				handled = true
 			}
 			miner.Close()
 		}
 
-		// 2. WhatsMiner перезапуск
 		if !handled {
-			if err := executeWhatsminerStrictCmd(*target, *user, *pass, "restart", apiVer); err != nil {
+			if err := executeWhatsminerStrictControl(*target, *user, *pass, "restart", apiVer); err != nil {
 				fmt.Fprintf(os.Stderr, "[ERROR] %v\n", err)
 				os.Exit(1)
 			}
