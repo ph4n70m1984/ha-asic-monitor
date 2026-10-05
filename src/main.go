@@ -54,177 +54,161 @@ func sha256Hex(s string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// executeWhatsminerSessionCmd выполняет отправку команды с корректным p_hash токеном
+// executeWhatsminerSessionCmd выполняет отправку команды строго под пользователем из HA
 func executeWhatsminerSessionCmd(ip, user, password, action string) error {
 	addr := net.JoinHostPort(ip, "4028")
-	fmt.Fprintf(os.Stderr, "[WM-EXEC] Подключение к %s (действие: %s)...\n", addr, action)
+	fmt.Fprintf(os.Stderr, "[WM-EXEC] Подключение к %s (user: %s, action: %s)...\n", addr, user, action)
 
 	pHash := sha256Hex(password)
 
-	// Список команд-кандидатов (сначала set.miner.service, затем прямой power_off / restart)
 	type tryCmd struct {
-		cmd     string
-		param   string
-		useB64  bool
-		useHash bool
+		cmd    string
+		param  string
+		useB64 bool
 	}
 
 	var candidates []tryCmd
 	if action == "stop" || action == "pause" {
 		candidates = []tryCmd{
-			{cmd: "set.miner.service", param: "stop", useB64: true, useHash: true},
-			{cmd: "set.power_off", param: "", useB64: true, useHash: true},
-			{cmd: "power_off", param: "", useB64: false, useHash: true},
+			{cmd: "set.miner.service", param: "stop", useB64: true},
+			{cmd: "set.power_off", param: "", useB64: true},
+			{cmd: "power_off", param: "", useB64: false},
 		}
 	} else if action == "start" || action == "resume" {
 		candidates = []tryCmd{
-			{cmd: "set.miner.service", param: "start", useB64: true, useHash: true},
-			{cmd: "restart", param: "", useB64: false, useHash: true},
+			{cmd: "set.miner.service", param: "start", useB64: true},
+			{cmd: "restart", param: "", useB64: false},
 		}
 	} else {
 		candidates = []tryCmd{
-			{cmd: "set.miner.service", param: "restart", useB64: true, useHash: true},
-			{cmd: "restart", param: "", useB64: false, useHash: true},
-			{cmd: "reboot", param: "", useB64: false, useHash: true},
+			{cmd: "set.miner.service", param: "restart", useB64: true},
+			{cmd: "restart", param: "", useB64: false},
+			{cmd: "reboot", param: "", useB64: false},
 		}
-	}
-
-	accounts := []string{"admin", "super"}
-	if user != "" && user != "root" && user != "admin" && user != "super" {
-		accounts = append([]string{user}, accounts...)
 	}
 
 	for _, cand := range candidates {
-		for _, acc := range accounts {
-			conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
-			if err != nil {
-				continue
-			}
+		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+		if err != nil {
+			continue
+		}
 
-			_ = conn.SetDeadline(time.Now().Add(4 * time.Second))
-			reader := bufio.NewReader(conn)
+		_ = conn.SetDeadline(time.Now().Add(4 * time.Second))
+		reader := bufio.NewReader(conn)
 
-			// 1. Запрос токена
-			if _, err := conn.Write([]byte("{\"command\":\"get_token\"}\n")); err != nil {
-				conn.Close()
-				continue
-			}
-
-			rawResp, err := reader.ReadBytes('\x00')
-			if err != nil && len(rawResp) == 0 {
-				rawResp, err = reader.ReadBytes('\n')
-			}
-			if err != nil || len(rawResp) == 0 {
-				conn.Close()
-				continue
-			}
-
-			respStr := strings.TrimRight(string(rawResp), "\x00\r\n")
-			var tokResp TokenResponse
-			if err := json.Unmarshal([]byte(respStr), &tokResp); err != nil {
-				conn.Close()
-				continue
-			}
-
-			var activeSalt string
-			var msgObj TokenMsg
-			if err := json.Unmarshal(tokResp.Msg, &msgObj); err == nil {
-				activeSalt = msgObj.NewSalt
-				if activeSalt == "" {
-					activeSalt = msgObj.Salt
-				}
-			}
-			if activeSalt == "" {
-				var plainStr string
-				if err := json.Unmarshal(tokResp.Msg, &plainStr); err == nil {
-					activeSalt = plainStr
-				}
-			}
-			if activeSalt == "" {
-				conn.Close()
-				continue
-			}
-
-			var payloadBytes []byte
-			var desc string
-
-			if cand.useB64 {
-				// Токен MicroBT v3/v4: Base64(SHA256(cmd + p_hash + salt + ts))[:8]
-				ts := time.Now().Unix()
-				concat := fmt.Sprintf("%s%s%s%d", cand.cmd, pHash, activeSalt, ts)
-				h := sha256.Sum256([]byte(concat))
-				b64Token := base64.StdEncoding.EncodeToString(h[:])
-				if len(b64Token) > 8 {
-					b64Token = b64Token[:8]
-				}
-
-				reqMap := map[string]interface{}{
-					"cmd":     cand.cmd,
-					"ts":      ts,
-					"token":   b64Token,
-					"account": acc,
-				}
-				if cand.param != "" {
-					reqMap["param"] = cand.param
-				}
-				payloadBytes, _ = json.Marshal(reqMap)
-				desc = fmt.Sprintf("%s (acc=%s, b64_token)", cand.cmd, acc)
-			} else {
-				// Классический токен: SHA256(p_hash + salt)
-				tokenHex := sha256Hex(pHash + activeSalt)
-				reqMap := map[string]interface{}{
-					"cmd":   cand.cmd,
-					"token": tokenHex,
-				}
-				payloadBytes, _ = json.Marshal(reqMap)
-				desc = fmt.Sprintf("%s (hex_token)", cand.cmd)
-			}
-
-			payloadBytes = append(payloadBytes, '\n')
-			fmt.Fprintf(os.Stderr, "[WM-EXEC] Отправка payload [%s]: %s", desc, string(payloadBytes))
-
-			if _, err := conn.Write(payloadBytes); err != nil {
-				conn.Close()
-				continue
-			}
-
-			_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
-			resRaw, err := reader.ReadBytes('\x00')
-			if err != nil && len(resRaw) == 0 {
-				resRaw, err = reader.ReadBytes('\n')
-			}
+		// 1. Запрос salt
+		if _, err := conn.Write([]byte("{\"command\":\"get_token\"}\n")); err != nil {
 			conn.Close()
+			continue
+		}
 
-			if err != nil && len(resRaw) == 0 {
-				fmt.Fprintf(os.Stderr, "[WM-EXEC] Сброс сокета на [%s]\n", desc)
-				if !cand.useB64 {
-					break // для hex команд смена account не имеет значения
-				}
-				continue
+		rawResp, err := reader.ReadBytes('\x00')
+		if err != nil && len(rawResp) == 0 {
+			rawResp, err = reader.ReadBytes('\n')
+		}
+		if err != nil || len(rawResp) == 0 {
+			conn.Close()
+			continue
+		}
+
+		respStr := strings.TrimRight(string(rawResp), "\x00\r\n")
+		var tokResp TokenResponse
+		if err := json.Unmarshal([]byte(respStr), &tokResp); err != nil {
+			conn.Close()
+			continue
+		}
+
+		var activeSalt string
+		var msgObj TokenMsg
+		if err := json.Unmarshal(tokResp.Msg, &msgObj); err == nil {
+			activeSalt = msgObj.NewSalt
+			if activeSalt == "" {
+				activeSalt = msgObj.Salt
+			}
+		}
+		if activeSalt == "" {
+			var plainStr string
+			if err := json.Unmarshal(tokResp.Msg, &plainStr); err == nil {
+				activeSalt = plainStr
+			}
+		}
+		if activeSalt == "" {
+			conn.Close()
+			continue
+		}
+
+		var payloadBytes []byte
+		var desc string
+
+		if cand.useB64 {
+			// Формула MicroBT modern: Base64(SHA256(cmd + p_hash + salt + ts))[:8]
+			ts := time.Now().Unix()
+			concat := fmt.Sprintf("%s%s%s%d", cand.cmd, pHash, activeSalt, ts)
+			h := sha256.Sum256([]byte(concat))
+			b64Token := base64.StdEncoding.EncodeToString(h[:])
+			if len(b64Token) > 8 {
+				b64Token = b64Token[:8]
 			}
 
-			cmdRespStr := strings.TrimRight(string(resRaw), "\x00\r\n")
-			fmt.Fprintf(os.Stderr, "[WM-EXEC] Ответ майнера: %s\n", cmdRespStr)
-
-			var res map[string]interface{}
-			if err := json.Unmarshal([]byte(cmdRespStr), &res); err == nil {
-				code, _ := res["code"].(float64)
-				msg, _ := res["msg"].(string)
-				status, _ := res["STATUS"].(string)
-
-				if code == 0 || strings.EqualFold(msg, "ok") || status == "S" || strings.Contains(strings.ToLower(cmdRespStr), "success") {
-					fmt.Fprintf(os.Stderr, "[WM-EXEC] Команда [%s] успешно подтверждена майнером!\n", desc)
-					return nil
-				}
+			reqMap := map[string]interface{}{
+				"cmd":     cand.cmd,
+				"ts":      ts,
+				"token":   b64Token,
+				"account": user,
 			}
+			if cand.param != "" {
+				reqMap["param"] = cand.param
+			}
+			payloadBytes, _ = json.Marshal(reqMap)
+			desc = fmt.Sprintf("%s (user=%s, b64)", cand.cmd, user)
+		} else {
+			// Формула MicroBT legacy: SHA256(p_hash + salt)
+			tokenHex := sha256Hex(pHash + activeSalt)
+			reqMap := map[string]interface{}{
+				"cmd":   cand.cmd,
+				"token": tokenHex,
+			}
+			payloadBytes, _ = json.Marshal(reqMap)
+			desc = fmt.Sprintf("%s (hex)", cand.cmd)
+		}
 
-			if !cand.useB64 {
-				break
+		payloadBytes = append(payloadBytes, '\n')
+		fmt.Fprintf(os.Stderr, "[WM-EXEC] Отправка payload [%s]: %s", desc, string(payloadBytes))
+
+		if _, err := conn.Write(payloadBytes); err != nil {
+			conn.Close()
+			continue
+		}
+
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+		resRaw, err := reader.ReadBytes('\x00')
+		if err != nil && len(resRaw) == 0 {
+			resRaw, err = reader.ReadBytes('\n')
+		}
+		conn.Close()
+
+		if err != nil && len(resRaw) == 0 {
+			fmt.Fprintf(os.Stderr, "[WM-EXEC] Сброс сокета на [%s]\n", desc)
+			continue
+		}
+
+		cmdRespStr := strings.TrimRight(string(resRaw), "\x00\r\n")
+		fmt.Fprintf(os.Stderr, "[WM-EXEC] Ответ майнера: %s\n", cmdRespStr)
+
+		var res map[string]interface{}
+		if err := json.Unmarshal([]byte(cmdRespStr), &res); err == nil {
+			code, _ := res["code"].(float64)
+			msg, _ := res["msg"].(string)
+			status, _ := res["STATUS"].(string)
+
+			if code == 0 || strings.EqualFold(msg, "ok") || status == "S" || strings.Contains(strings.ToLower(cmdRespStr), "success") {
+				fmt.Fprintf(os.Stderr, "[WM-EXEC] Команда [%s] успешно подтверждена майнером!\n", desc)
+				return nil
 			}
 		}
 	}
 
-	return fmt.Errorf("майнер отклонил команду для действия %s", action)
+	return fmt.Errorf("майнер отклонил команду для пользователя '%s' (действие: %s)", user, action)
 }
 
 func main() {
@@ -341,7 +325,7 @@ func main() {
 		_ = json.NewEncoder(os.Stdout).Encode(out)
 
 	case "pause":
-		// 1. Проверяем VNish / Braiins OS через FFI[cite: 5]
+		// 1. Проверяем VNish / Braiins OS через FFI[cite: 7]
 		f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(4)
 		miner, err := f.GetMiner(*target)
 		f.Close()
@@ -359,7 +343,7 @@ func main() {
 			miner.Close()
 		}
 
-		// 2. WhatsMiner: пробуем с p_hash
+		// 2. WhatsMiner строго под переданной парой user:pass
 		if !handled {
 			if err := executeWhatsminerSessionCmd(*target, *user, *pass, "stop"); err != nil {
 				fmt.Fprintf(os.Stderr, "[ERROR] %v\n", err)
