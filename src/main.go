@@ -2,6 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -49,7 +52,7 @@ func sha256Hex(s string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// executeWhatsminerTCP отправляет JSON-команду на порт 4028 и читает ответ
+// executeWhatsminerTCP отправляет JSON-команду на порт 4028 и читает сырой ответ
 func executeWhatsminerTCP(ip string, reqBytes []byte) ([]byte, error) {
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, "4028"), 4*time.Second)
 	if err != nil {
@@ -73,6 +76,33 @@ func executeWhatsminerTCP(ip string, reqBytes []byte) ([]byte, error) {
 		resp, err = reader.ReadBytes('\n')
 	}
 	return resp, err
+}
+
+// -------------------------------------------------------------
+// AES-256 шифрование параметров по спецификации MicroBT
+// -------------------------------------------------------------
+
+func pkcs7Padding(data []byte, blockSize int) []byte {
+	padding := blockSize - len(data)%blockSize
+	padtext := bytes.Repeat([]byte{byte(padding)}, padding)
+	return append(data, padtext...)
+}
+
+func encryptParam(plainText string, aesKey []byte) (string, error) {
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return "", err
+	}
+
+	padded := pkcs7Padding([]byte(plainText), aes.BlockSize)
+	ciphertext := make([]byte, len(padded))
+
+	// В спецификации MicroBT используется вектор инициализации IV из 16 нулей
+	iv := make([]byte, aes.BlockSize)
+	mode := cipher.NewCBCEncrypter(block, iv)
+	mode.CryptBlocks(ciphertext, padded)
+
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
 }
 
 // -------------------------------------------------------------
@@ -104,16 +134,6 @@ func getSalt(ip string) (string, error) {
 	return "", fmt.Errorf("в ответе нет salt: %s", cleanResp)
 }
 
-func generateModernToken(cmd, password, salt string, ts int64) string {
-	payload := fmt.Sprintf("%s%s%s%d", cmd, password, salt, ts)
-	hash := sha256.Sum256([]byte(payload))
-	b64 := base64.StdEncoding.EncodeToString(hash[:])
-	if len(b64) >= 8 {
-		return b64[:8]
-	}
-	return b64
-}
-
 func sendWhatsminerV4Cmd(ip, user, password, action string) error {
 	fmt.Fprintf(os.Stderr, "[WM-V4] Получение salt у %s...\n", ip)
 	salt, err := getSalt(ip)
@@ -122,61 +142,69 @@ func sendWhatsminerV4Cmd(ip, user, password, action string) error {
 	}
 	fmt.Fprintf(os.Stderr, "[WM-V4] Salt получен: %s\n", salt)
 
-	var targetCmds []struct {
-		cmd   string
-		param interface{}
-	}
-
-	switch action {
-	case "power_off":
-		targetCmds = []struct {
-			cmd   string
-			param interface{}
-		}{
-			{"set.miner.power", "off"},
-			{"set.power_off", nil},
-			{"set.miner.power_off", nil},
-		}
-	case "resume":
-		targetCmds = []struct {
-			cmd   string
-			param interface{}
-		}{
-			{"set.miner.power", "on"},
-			{"set.miner.power_on", nil},
-			{"set.miner.restart", nil},
-		}
-	default: // restart
-		targetCmds = []struct {
-			cmd   string
-			param interface{}
-		}{
-			{"set.miner.restart", nil},
-			{"set.system.reboot", nil},
-		}
-	}
-
 	account := user
 	if account == "" || account == "root" {
 		account = "admin"
 	}
 
-	for _, tc := range targetCmds {
+	type targetItem struct {
+		cmd      string
+		rawParam string // Если пусто, отправляется без параметра
+	}
+
+	var targets []targetItem
+	switch action {
+	case "power_off":
+		targets = []targetItem{
+			{cmd: "set.power_off", rawParam: ""},
+			{cmd: "set.miner.power_off", rawParam: ""},
+			{cmd: "set.miner.power", rawParam: `"off"`},
+		}
+	case "resume":
+		targets = []targetItem{
+			{cmd: "set.miner.power", rawParam: `"on"`},
+			{cmd: "set.miner.power_on", rawParam: ""},
+			{cmd: "set.miner.restart", rawParam: ""},
+		}
+	default: // restart
+		targets = []targetItem{
+			{cmd: "set.miner.restart", rawParam: ""},
+			{cmd: "set.system.reboot", rawParam: ""},
+		}
+	}
+
+	for _, tc := range targets {
 		ts := time.Now().Unix()
-		token := generateModernToken(tc.cmd, password, salt, ts)
+
+		// 1. Вычисляем 32-байтный SHA256: sha256(cmd + password + salt + ts)
+		concat := fmt.Sprintf("%s%s%s%d", tc.cmd, password, salt, ts)
+		shaKey := sha256.Sum256([]byte(concat))
+
+		// 2. Токен: первые 8 символов от Base64
+		b64Token := base64.StdEncoding.EncodeToString(shaKey[:])
+		if len(b64Token) > 8 {
+			b64Token = b64Token[:8]
+		}
 
 		reqMap := map[string]interface{}{
 			"cmd":     tc.cmd,
 			"account": account,
 			"ts":      ts,
-			"token":   token,
+			"token":   b64Token,
 		}
-		if tc.param != nil {
-			reqMap["param"] = tc.param
+
+		// 3. Если требуется параметр, шифруем его ключом shaKey
+		if tc.rawParam != "" {
+			encParam, err := encryptParam(tc.rawParam, shaKey[:])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[WM-V4] Ошибка шифрования param для %s: %v\n", tc.cmd, err)
+				continue
+			}
+			reqMap["param"] = encParam
 		}
 
 		reqBytes, _ := json.Marshal(reqMap)
-		fmt.Fprintf(os.Stderr, "[WM-V4] Отправка: %s\n", string(reqBytes))
+		fmt.Fprintf(os.Stderr, "[WM-V4] Отправка команды: %s\n", string(reqBytes))
 
 		respBytes, err := executeWhatsminerTCP(ip, reqBytes)
 		if err != nil {
@@ -185,7 +213,7 @@ func sendWhatsminerV4Cmd(ip, user, password, action string) error {
 		}
 
 		respStr := strings.TrimRight(string(respBytes), "\x00\r\n")
-		fmt.Fprintf(os.Stderr, "[WM-V4] Ответ: %s\n", respStr)
+		fmt.Fprintf(os.Stderr, "[WM-V4] Ответ майнера: %s\n", respStr)
 
 		var res map[string]interface{}
 		if err := json.Unmarshal([]byte(respStr), &res); err == nil {
@@ -193,7 +221,7 @@ func sendWhatsminerV4Cmd(ip, user, password, action string) error {
 			code, _ := res["code"].(float64)
 			msg, _ := res["msg"].(string)
 			if strings.EqualFold(status, "success") || strings.EqualFold(status, "s") || code == 0 || strings.Contains(strings.ToLower(msg), "success") {
-				fmt.Fprintf(os.Stderr, "[WM-V4] Команда '%s' выполнена успешно!\n", tc.cmd)
+				fmt.Fprintf(os.Stderr, "[WM-V4] Команда '%s' успешно выполнена!\n", tc.cmd)
 				return nil
 			}
 		}
@@ -261,7 +289,6 @@ func sendWhatsminerLegacyCmd(ip, user, password, cmd string) error {
 // -------------------------------------------------------------
 
 func dispatchCommand(ip, user, password, action string, miner *asic_go.Miner) error {
-	// 1. Пытаемся получить версию API через добавленный метод
 	var apiVer string
 	if miner != nil {
 		if verPtr, err := miner.GetAPIVersion(); err == nil && verPtr != nil {
@@ -270,7 +297,7 @@ func dispatchCommand(ip, user, password, action string, miner *asic_go.Miner) er
 		}
 	}
 
-	// 2. Если версия 3.x, 4.x или не определена (по умолчанию для M60/M61), запускаем Salted API
+	// Если API v3+, v4+ или версия не определена, используем Salted протокол MicroBT
 	if apiVer == "" || strings.HasPrefix(apiVer, "3") || strings.HasPrefix(apiVer, "4") || strings.Contains(apiVer, "v3") || strings.Contains(apiVer, "v4") {
 		err := sendWhatsminerV4Cmd(ip, user, password, action)
 		if err == nil {
@@ -279,7 +306,6 @@ func dispatchCommand(ip, user, password, action string, miner *asic_go.Miner) er
 		fmt.Fprintf(os.Stderr, "[WM-AUTH] V4 протокол вернул ошибку (%v), пробуем Legacy протокол...\n", err)
 	}
 
-	// 3. Фолбэк на legacy протокол (v1/v2)
 	legacyCmd := "power_off"
 	if action == "resume" || action == "restart" {
 		legacyCmd = "restart"
