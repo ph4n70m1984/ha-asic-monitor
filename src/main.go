@@ -2,6 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -56,7 +59,25 @@ func sha256Hex(s string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// readSocketLine аккуратно читает ответ до \n или \x00
+func pkcs7Padding(data []byte, blockSize int) []byte {
+	padding := blockSize - len(data)%blockSize
+	padtext := bytes.Repeat([]byte{byte(padding)}, padding)
+	return append(data, padtext...)
+}
+
+func encryptParamAES(plainText string, aesKey []byte) (string, error) {
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return "", err
+	}
+	padded := pkcs7Padding([]byte(plainText), aes.BlockSize)
+	ciphertext := make([]byte, len(padded))
+	iv := make([]byte, aes.BlockSize)
+	mode := cipher.NewCBCEncrypter(block, iv)
+	mode.CryptBlocks(ciphertext, padded)
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
+}
+
 func readSocketLine(r *bufio.Reader) ([]byte, error) {
 	var buf []byte
 	for {
@@ -120,71 +141,151 @@ func executeWhatsminerStrictControl(ip, user, password, action, apiVer string) e
 	}
 	accountsToTry = append(accountsToTry, "admin", "super")
 
-	var targetParam string
-	switch action {
-	case "stop", "pause", "power_off":
-		targetParam = "stop"
-	case "start", "resume":
-		targetParam = "start"
-	default:
-		targetParam = "restart"
-	}
+	if !isModern {
+		// --- API < 3.0.5 (Legacy power_off / restart) ---
+		legacyCmd := "power_off"
+		if action == "start" || action == "resume" || action == "restart" {
+			legacyCmd = "restart"
+		}
 
-	for _, acc := range accountsToTry {
 		conn, err := net.DialTimeout("tcp", addr, 4*time.Second)
 		if err != nil {
-			return fmt.Errorf("ошибка подключения к сокету: %w", err)
+			return err
 		}
+		defer conn.Close()
 		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 		reader := bufio.NewReader(conn)
 
-		// 1. Получаем salt
 		if _, err := conn.Write([]byte("{\"command\":\"get_token\"}\n")); err != nil {
-			conn.Close()
-			continue
+			return err
 		}
-
-		rawResp, err := readSocketLine(reader)
-		if err != nil || len(rawResp) == 0 {
-			conn.Close()
-			continue
-		}
-
-		respStr := strings.TrimRight(string(rawResp), "\x00\r\n")
+		rawResp, _ := readSocketLine(reader)
 		var tokResp TokenResponse
-		if err := json.Unmarshal([]byte(respStr), &tokResp); err != nil {
-			conn.Close()
-			continue
-		}
+		_ = json.Unmarshal(rawResp, &tokResp)
 
 		var activeSalt string
 		var msgObj TokenMsg
 		if err := json.Unmarshal(tokResp.Msg, &msgObj); err == nil {
-			if msgObj.NewSalt != "" {
-				activeSalt = msgObj.NewSalt
-			} else if msgObj.Salt != "" {
+			activeSalt = msgObj.NewSalt
+			if activeSalt == "" {
 				activeSalt = msgObj.Salt
 			}
 		}
 		if activeSalt == "" {
-			var plainStr string
-			if err := json.Unmarshal(tokResp.Msg, &plainStr); err == nil {
-				activeSalt = plainStr
+			var s string
+			_ = json.Unmarshal(tokResp.Msg, &s)
+			activeSalt = s
+		}
+
+		pHash := sha256Hex(password)
+		hexToken := sha256Hex(pHash + activeSalt)
+		payloadBytes, _ := json.Marshal(map[string]interface{}{
+			"cmd":   legacyCmd,
+			"token": hexToken,
+		})
+		payloadBytes = append(payloadBytes, '\n')
+
+		fmt.Fprintf(os.Stderr, "[WM-STRICT] Отправка legacy команды: %s", string(payloadBytes))
+		_, _ = conn.Write(payloadBytes)
+		resRaw, _ := readSocketLine(reader)
+		resStr := string(resRaw)
+		if strings.Contains(resStr, "\"STATUS\":\"S\"") || strings.Contains(resStr, "\"code\":0") || strings.Contains(strings.ToLower(resStr), "ok") {
+			fmt.Fprintf(os.Stderr, "[WM-STRICT] Legacy команда '%s' подтверждена!\n", legacyCmd)
+			return nil
+		}
+		return fmt.Errorf("legacy майнер отклонил команду: %s", resStr)
+	}
+
+	// --- API >= 3.0.5 (Modern MicroBT Commands) ---
+	type attempt struct {
+		cmd          string
+		param        string
+		useAES       bool
+		useAccInHash bool
+	}
+
+	var attempts []attempt
+	if action == "stop" || action == "pause" || action == "power_off" {
+		attempts = []attempt{
+			// 1. set.power_off (без параметров, наиболее стабильная команда отключения)
+			{cmd: "set.power_off", param: "", useAES: false, useAccInHash: false},
+			{cmd: "set.power_off", param: "", useAES: false, useAccInHash: true},
+			// 2. set.miner.service stop (с открытым параметром)
+			{cmd: "set.miner.service", param: "stop", useAES: false, useAccInHash: false},
+			{cmd: "set.miner.service", param: "stop", useAES: false, useAccInHash: true},
+			// 3. set.miner.service stop (с AES шифрованием)
+			{cmd: "set.miner.service", param: "stop", useAES: true, useAccInHash: false},
+			{cmd: "set.miner.service", param: "stop", useAES: true, useAccInHash: true},
+		}
+	} else if action == "start" || action == "resume" {
+		attempts = []attempt{
+			{cmd: "set.miner.power_on", param: "", useAES: false, useAccInHash: false},
+			{cmd: "set.miner.service", param: "start", useAES: false, useAccInHash: false},
+			{cmd: "set.miner.service", param: "start", useAES: false, useAccInHash: true},
+			{cmd: "set.miner.service", param: "start", useAES: true, useAccInHash: false},
+		}
+	} else { // restart
+		attempts = []attempt{
+			{cmd: "set.miner.restart", param: "", useAES: false, useAccInHash: false},
+			{cmd: "set.miner.service", param: "restart", useAES: false, useAccInHash: false},
+			{cmd: "set.miner.service", param: "restart", useAES: false, useAccInHash: true},
+		}
+	}
+
+	for _, acc := range accountsToTry {
+		for _, att := range attempts {
+			conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+			if err != nil {
+				continue
 			}
-		}
-		if activeSalt == "" {
-			conn.Close()
-			continue
-		}
+			_ = conn.SetDeadline(time.Now().Add(4 * time.Second))
+			reader := bufio.NewReader(conn)
 
-		var payloadBytes []byte
-		var desc string
+			// 1. Запрашиваем токен
+			if _, err := conn.Write([]byte("{\"command\":\"get_token\"}\n")); err != nil {
+				conn.Close()
+				continue
+			}
 
-		if isModern {
-			// Документированный формат set.miner.service
-			cmdName := "set.miner.service"
+			rawResp, err := readSocketLine(reader)
+			if err != nil || len(rawResp) == 0 {
+				conn.Close()
+				continue
+			}
+
+			var tokResp TokenResponse
+			if err := json.Unmarshal(rawResp, &tokResp); err != nil {
+				conn.Close()
+				continue
+			}
+
+			var activeSalt string
+			var msgObj TokenMsg
+			if err := json.Unmarshal(tokResp.Msg, &msgObj); err == nil {
+				activeSalt = msgObj.NewSalt
+				if activeSalt == "" {
+					activeSalt = msgObj.Salt
+				}
+			}
+			if activeSalt == "" {
+				var s string
+				_ = json.Unmarshal(tokResp.Msg, &s)
+				activeSalt = s
+			}
+			if activeSalt == "" {
+				conn.Close()
+				continue
+			}
+
 			ts := time.Now().Unix()
-			concat := fmt.Sprintf("%s%s%s%d", cmdName, password, activeSalt, ts)
+
+			// Вычисление SHA256 ключа
+			var concat string
+			if att.useAccInHash {
+				concat = fmt.Sprintf("%s%s%s%s%d", att.cmd, password, activeSalt, acc, ts)
+			} else {
+				concat = fmt.Sprintf("%s%s%s%d", att.cmd, password, activeSalt, ts)
+			}
 			shaKey := sha256.Sum256([]byte(concat))
 			b64Token := base64.StdEncoding.EncodeToString(shaKey[:])
 			if len(b64Token) > 8 {
@@ -192,67 +293,61 @@ func executeWhatsminerStrictControl(ip, user, password, action, apiVer string) e
 			}
 
 			reqMap := map[string]interface{}{
-				"cmd":     cmdName,
+				"cmd":     att.cmd,
 				"ts":      ts,
 				"token":   b64Token,
 				"account": acc,
-				"param":   targetParam,
 			}
-			payloadBytes, _ = json.Marshal(reqMap)
-			desc = fmt.Sprintf("set.miner.service (param: %s, account: %s)", targetParam, acc)
-		} else {
-			// API < 3.0.5: power_off / restart с Hex-токеном
-			legacyCmd := "power_off"
-			if action == "start" || action == "resume" || action == "restart" {
-				legacyCmd = "restart"
-			}
-			pHash := sha256Hex(password)
-			hexToken := sha256Hex(pHash + activeSalt)
-			payloadBytes, _ = json.Marshal(map[string]interface{}{
-				"cmd":   legacyCmd,
-				"token": hexToken,
-			})
-			desc = fmt.Sprintf("legacy %s", legacyCmd)
-		}
-		payloadBytes = append(payloadBytes, '\n')
 
-		fmt.Fprintf(os.Stderr, "[WM-STRICT] Отправка команды [%s]: %s", desc, string(payloadBytes))
-		if _, err := conn.Write(payloadBytes); err != nil {
+			if att.param != "" {
+				if att.useAES {
+					enc, err := encryptParamAES(att.param, shaKey[:])
+					if err != nil {
+						conn.Close()
+						continue
+					}
+					reqMap["param"] = enc
+				} else {
+					reqMap["param"] = att.param
+				}
+			}
+
+			payloadBytes, _ := json.Marshal(reqMap)
+			payloadBytes = append(payloadBytes, '\n')
+
+			fmt.Fprintf(os.Stderr, "[WM-STRICT] Пробуем %s (acc=%s, AES=%t, accHash=%t): %s", att.cmd, acc, att.useAES, att.useAccInHash, string(payloadBytes))
+			if _, err := conn.Write(payloadBytes); err != nil {
+				conn.Close()
+				continue
+			}
+
+			_ = conn.SetDeadline(time.Now().Add(4 * time.Second))
+			resRaw, err := readSocketLine(reader)
 			conn.Close()
-			continue
-		}
 
-		_ = conn.SetDeadline(time.Now().Add(4 * time.Second))
-		resRaw, err := readSocketLine(reader)
-		conn.Close()
-
-		if err != nil && len(resRaw) == 0 {
-			fmt.Fprintf(os.Stderr, "[WM-STRICT] Майнер сбросил сокет при account=%s\n", acc)
-			continue
-		}
-
-		cmdRespStr := strings.TrimRight(string(resRaw), "\x00\r\n")
-		fmt.Fprintf(os.Stderr, "[WM-STRICT] Ответ майнера: %s\n", cmdRespStr)
-
-		var res map[string]interface{}
-		if err := json.Unmarshal([]byte(cmdRespStr), &res); err == nil {
-			code, _ := res["code"].(float64)
-			msg, _ := res["msg"].(string)
-			status, _ := res["STATUS"].(string)
-
-			if code == 0 || strings.EqualFold(msg, "ok") || status == "S" || strings.Contains(strings.ToLower(cmdRespStr), "success") {
-				fmt.Fprintf(os.Stderr, "[WM-STRICT] Команда [%s] успешно подтверждена майнером!\n", desc)
-				return nil
+			if err != nil && len(resRaw) == 0 {
+				fmt.Fprintf(os.Stderr, "[WM-STRICT] Сброс сокета на %s\n", att.cmd)
+				continue
 			}
-		}
 
-		// Если это legacy режим, повторные попытки с другим аккаунтом не требуются
-		if !isModern {
-			break
+			cmdRespStr := strings.TrimRight(string(resRaw), "\x00\r\n")
+			fmt.Fprintf(os.Stderr, "[WM-STRICT] Ответ: %s\n", cmdRespStr)
+
+			var res map[string]interface{}
+			if err := json.Unmarshal([]byte(cmdRespStr), &res); err == nil {
+				code, _ := res["code"].(float64)
+				msg, _ := res["msg"].(string)
+				status, _ := res["STATUS"].(string)
+
+				if code == 0 || strings.EqualFold(msg, "ok") || status == "S" || strings.Contains(strings.ToLower(cmdRespStr), "success") {
+					fmt.Fprintf(os.Stderr, "[WM-STRICT] Команда '%s' успешно принята майнером!\n", att.cmd)
+					return nil
+				}
+			}
 		}
 	}
 
-	return fmt.Errorf("майнер отклонил команду для API %s (проверьте пароль)", apiVer)
+	return fmt.Errorf("майнер отклонил все варианты команд для API %s (проверьте пароль)", apiVer)
 }
 
 func main() {
@@ -369,7 +464,7 @@ func main() {
 		_ = json.NewEncoder(os.Stdout).Encode(out)
 
 	case "pause":
-		// 1. Проверяем VNish / Braiins OS через FFI
+		// 1. Проверяем VNish / Braiins OS через FFI[cite: 8]
 		f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(4)
 		miner, err := f.GetMiner(*target)
 		f.Close()
