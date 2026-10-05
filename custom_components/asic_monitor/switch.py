@@ -40,8 +40,8 @@ class AsicMiningSwitch(CoordinatorEntity[AsicDataCoordinator], SwitchEntity):
 	def __init__(self, coordinator: AsicDataCoordinator, ip: str) -> None:
 		super().__init__(coordinator)
 		self.ip = ip
-		raw_ip = ip.replace(".", "_")
-		self._attr_unique_id = f"{raw_ip}_mining_switch"
+		self._attr_unique_id = f"{ip}_mining"
+		self._override_state: bool | None = None
 
 	@property
 	def device_info(self):
@@ -49,7 +49,7 @@ class AsicMiningSwitch(CoordinatorEntity[AsicDataCoordinator], SwitchEntity):
 		return {
 			"identifiers": {(DOMAIN, self.ip)},
 			"name": f"ASIC {self.ip}",
-			"manufacturer": data.get("make", "ASIC"),
+			"manufacturer": data.get("make", "WhatsMiner"),
 			"model": data.get("model", "Miner"),
 			"sw_version": data.get("firmware"),
 		}
@@ -60,6 +60,8 @@ class AsicMiningSwitch(CoordinatorEntity[AsicDataCoordinator], SwitchEntity):
 
 	@property
 	def is_on(self) -> bool:
+		if self._override_state is not None:
+			return self._override_state
 		data = self.coordinator.data.get(self.ip)
 		if not data:
 			return False
@@ -69,8 +71,18 @@ class AsicMiningSwitch(CoordinatorEntity[AsicDataCoordinator], SwitchEntity):
 
 	async def async_turn_on(self, **kwargs: Any) -> None:
 		"""Запуск майнинга."""
-		await self.coordinator.async_resume_miner(self.ip)
+		self._override_state = True
+		self.async_write_ha_state()
+		try:
+			await self.coordinator.async_resume_miner(self.ip)
+		finally:
+			self._override_state = None
 
 	async def async_turn_off(self, **kwargs: Any) -> None:
 		"""Остановка (пауза) майнинга."""
-		await self.coordinator.async_pause_miner(self.ip)
+		self._override_state = False
+		self.async_write_ha_state()
+		try:
+			await self.coordinator.async_pause_miner(self.ip)
+		finally:
+			self._override_state = None
