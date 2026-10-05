@@ -67,9 +67,16 @@ class AsicDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 				_LOGGER.warning("Could not set executable permissions on %s: %s", self.bin_path, err)
 
 	async def _run_cmd(self, *args: str) -> str:
-		"""Запуск вспомогательного бинарника с логированием в журнал HA."""
+		"""Запуск вспомогательного бинарника с обязательным логированием в журнал HA."""
 		if not os.path.isfile(self.bin_path):
+			_LOGGER.error("Scanner binary missing at: %s", self.bin_path)
 			raise UpdateFailed(f"Scanner binary missing at: {self.bin_path}")
+
+		cmd_display = " ".join([self.bin_path, *args])
+		
+		# Логируем запуск команд управления (pause, resume, restart)
+		if "-cmd poll" not in cmd_display:
+			_LOGGER.warning("[ASIC-EXEC] Выполняется команда: %s", cmd_display)
 
 		proc = await asyncio.create_subprocess_exec(
 			self.bin_path,
@@ -78,32 +85,36 @@ class AsicDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 			stderr=asyncio.subprocess.PIPE,
 		)
 		stdout, stderr = await proc.communicate()
-		
-		# Логируем stderr бинарника в журнал Home Assistant
+
+		# Логируем stderr бинарника на уровне WARNING
 		err_output = stderr.decode(errors="replace").strip()
 		if err_output:
 			for line in err_output.splitlines():
-				_LOGGER.debug("[GoScanner] %s", line)
+				_LOGGER.warning("[GoScanner-STDERR] %s", line)
+
+		std_output = stdout.decode(errors="replace").strip()
+		if std_output and "-cmd poll" not in cmd_display:
+			_LOGGER.warning("[GoScanner-STDOUT] %s", std_output)
 
 		if proc.returncode != 0:
 			_LOGGER.error("Scanner failed (code %s): %s", proc.returncode, err_output)
 			raise UpdateFailed(f"Scanner error: {err_output}")
 
-		return stdout.decode(errors="replace").strip()
+		return std_output
 
-	
 	async def _scan_subnets(self) -> None:
 		"""Поиск активных IP в подсетях."""
 		try:
 			raw = await self._run_cmd("-cmd", "scan", "-target", self.subnets)
 			ips = json.loads(raw) or []
 			self.known_ips.update(ips)
-			_LOGGER.info("ASIC Monitor [%s]: found active IPs: %s", self.subnets, self.known_ips)
+			_LOGGER.warning("ASIC Monitor [%s]: найдены активные IP: %s", self.subnets, self.known_ips)
 		except Exception as err:
 			_LOGGER.error("Error during subnet scan [%s]: %s", self.subnets, err)
 
 	async def async_restart_miner(self, ip: str) -> None:
 		"""Отправка команды перезагрузки с авторизацией."""
+		_LOGGER.warning("[ASIC-ACTION] Получен сигнал RESTART для %s (user: %s)", ip, self.username)
 		await self._run_cmd(
 			"-cmd", "restart",
 			"-target", ip,
@@ -113,6 +124,7 @@ class AsicDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
 	async def async_pause_miner(self, ip: str) -> None:
 		"""Остановка (пауза) майнинга."""
+		_LOGGER.warning("[ASIC-ACTION] Получен сигнал PAUSE (выключение) для %s (user: %s)", ip, self.username)
 		await self._run_cmd(
 			"-cmd", "pause",
 			"-target", ip,
@@ -123,6 +135,7 @@ class AsicDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
 	async def async_resume_miner(self, ip: str) -> None:
 		"""Запуск (возобновление) майнинга."""
+		_LOGGER.warning("[ASIC-ACTION] Получен сигнал RESUME (запуск) для %s (user: %s)", ip, self.username)
 		await self._run_cmd(
 			"-cmd", "resume",
 			"-target", ip,
