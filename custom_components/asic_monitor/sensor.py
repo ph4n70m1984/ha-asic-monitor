@@ -7,7 +7,7 @@ from homeassistant.components.sensor import (
 	SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfPower, UnitOfTemperature
+from homeassistant.const import UnitOfPower, UnitOfTemperature, EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -33,6 +33,7 @@ async def async_setup_entry(
 					AsicChipTempSensor(coordinator, ip),
 					AsicPoolUrlSensor(coordinator, ip),
 					AsicPoolUserSensor(coordinator, ip),
+					AsicApiVersionSensor(coordinator, ip),
 				])
 		if new_entities:
 			async_add_entities(new_entities)
@@ -51,12 +52,16 @@ class AsicBaseSensor(CoordinatorEntity[AsicDataCoordinator], SensorEntity):
 	@property
 	def device_info(self):
 		data = self.coordinator.data.get(self.ip, {})
+		sw = data.get("firmware", "Stock")
+		if api_ver := data.get("api_version"):
+			sw = f"{sw} (API {api_ver})"
+
 		return {
 			"identifiers": {(DOMAIN, self.ip)},
 			"name": f"ASIC {self.ip}",
-			"manufacturer": data.get("make", "ASIC"),
+			"manufacturer": data.get("make", "WhatsMiner"),
 			"model": data.get("model", "Miner"),
-			"sw_version": data.get("firmware"),
+			"sw_version": sw,
 		}
 
 	@property
@@ -134,3 +139,19 @@ class AsicPoolUserSensor(AsicBaseSensor):
 	def native_value(self) -> str | None:
 		data = self.coordinator.data.get(self.ip)
 		return data.get("pool_user") if data else None
+
+class AsicApiVersionSensor(AsicBaseSensor):
+	"""Сенсор версии API майнера."""
+
+	_attr_name = "API Version"
+	_attr_icon = "mdi:code-json"
+	_attr_entity_category = EntityCategory.DIAGNOSTIC
+
+	@property
+	def unique_id(self) -> str:
+		return f"{self.ip}_api_version"
+
+	@property
+	def native_value(self) -> str | None:
+		data = self.coordinator.data.get(self.ip)
+		return data.get("api_version") if data else None

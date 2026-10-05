@@ -47,12 +47,16 @@ class AsicMiningStatusSensor(CoordinatorEntity[AsicDataCoordinator], BinarySenso
 	@property
 	def device_info(self):
 		data = self.coordinator.data.get(self.ip, {})
+		sw = data.get("firmware", "WhatsMiner Stock")
+		if api_ver := data.get("api_version"):
+			sw = f"{sw} (API {api_ver})"
+
 		return {
 			"identifiers": {(DOMAIN, self.ip)},
 			"name": f"ASIC {self.ip}",
-			"manufacturer": data.get("make", "ASIC"),
+			"manufacturer": data.get("make", "WhatsMiner"),
 			"model": data.get("model", "Miner"),
-			"sw_version": data.get("firmware"),
+			"sw_version": sw,
 		}
 
 	@property
