@@ -1,10 +1,16 @@
 package main
 
 import (
+	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
+	"fmt"
+	"net"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/256foundation/asic-rs/go/asic_go"
 )
@@ -23,11 +29,90 @@ type Output struct {
 	CanRestart  bool     `json:"can_restart"`
 }
 
+type TokenResp struct {
+	STATUS string `json:"STATUS"`
+	Msg    string `json:"Msg"`
+}
+
 func getEnv(key, fallback string) string {
 	if val := os.Getenv(key); val != "" {
 		return val
 	}
 	return fallback
+}
+
+// sendPrivilegedWhatsminerCmd выполняет авторизацию через get_token и отправляет привилегированную команду
+func sendPrivilegedWhatsminerCmd(ip, user, password, cmd string) error {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, "4028"), 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("connect error: %w", err)
+	}
+	defer conn.Close()
+
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	reader := bufio.NewReader(conn)
+
+	// Шаг 1: Запрашиваем токен
+	if _, err := conn.Write([]byte(`{"cmd":"get_token"}` + "\n")); err != nil {
+		return fmt.Errorf("failed to request token: %w", err)
+	}
+
+	line, err := reader.ReadBytes('\x00')
+	if err != nil {
+		// Некоторые версии WhatsMiner завершают ответ переходом строки \n, а не null-byte
+		line, err = reader.ReadBytes('\n')
+		if err != nil {
+			return fmt.Errorf("failed to read token response: %w", err)
+		}
+	}
+
+	var tResp TokenResp
+	cleanLine := strings.TrimRight(string(line), "\x00\r\n")
+	if err := json.Unmarshal([]byte(cleanLine), &tResp); err != nil {
+		return fmt.Errorf("failed to parse token response: %w", err)
+	}
+
+	token := tResp.Msg
+	if token == "" {
+		return fmt.Errorf("empty token received from miner")
+	}
+
+	// Шаг 2: Расчет SHA-256 подписи
+	// WhatsMiner протокол: sha256(password + token)
+	h := sha256.New()
+	h.Write([]byte(password + token))
+	sign := hex.EncodeToString(h.Sum(nil))
+
+	// Шаг 3: Отправка привилегированной команды
+	req := map[string]string{
+		"cmd":   cmd,
+		"token": token,
+		"sign":  sign,
+	}
+	reqBytes, _ := json.Marshal(req)
+	reqBytes = append(reqBytes, '\n')
+
+	if _, err := conn.Write(reqBytes); err != nil {
+		return fmt.Errorf("failed to send privileged command: %w", err)
+	}
+
+	// Читаем подтверждение выполнения
+	respLine, _ := reader.ReadBytes('\n')
+	if len(respLine) > 0 {
+		var res map[string]interface{}
+		_ = json.Unmarshal(respLine, &res)
+		// Если статус F (Failed), пробуем альтернативную схему sha256(user + password + token)
+		if status, ok := res["STATUS"].(string); ok && status == "F" {
+			h2 := sha256.New()
+			h2.Write([]byte(user + password + token))
+			req["sign"] = hex.EncodeToString(h2.Sum(nil))
+			reqBytes2, _ := json.Marshal(req)
+			reqBytes2 = append(reqBytes2, '\n')
+			_, _ = conn.Write(reqBytes2)
+		}
+	}
+
+	return nil
 }
 
 func main() {
@@ -148,32 +233,50 @@ func main() {
 			}
 			_, _ = miner.Restart()
 			miner.Close()
+		} else {
+			_ = sendPrivilegedWhatsminerCmd(*target, *user, *pass, "restart")
 		}
 
 	case "pause":
+		// Приостановка майнинга (выключение плат хэширования)
 		f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(8)
 		defer f.Close()
 
 		miner, err := f.GetMiner(*target)
+		handled := false
 		if err == nil {
 			if *user != "" && *pass != "" {
 				_ = miner.SetAuth(*user, *pass)
 			}
-			_, _ = miner.Pause(nil)
+			ok, _ := miner.Pause(nil)
+			handled = ok
 			miner.Close()
 		}
 
+		// Если FFI-метод не отработал (сток WhatsMiner), вызываем привилегированный power_off
+		if !handled {
+			_ = sendPrivilegedWhatsminerCmd(*target, *user, *pass, "power_off")
+		}
+
 	case "resume":
+		// Возобновление майнинга
 		f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(8)
 		defer f.Close()
 
 		miner, err := f.GetMiner(*target)
+		handled := false
 		if err == nil {
 			if *user != "" && *pass != "" {
 				_ = miner.SetAuth(*user, *pass)
 			}
-			_, _ = miner.Resume(nil)
+			ok, _ := miner.Resume(nil)
+			handled = ok
 			miner.Close()
+		}
+
+		// Для стока WhatsMiner возврат в работу делается через рестарт btminer сервиса
+		if !handled {
+			_ = sendPrivilegedWhatsminerCmd(*target, *user, *pass, "restart")
 		}
 	}
 }
