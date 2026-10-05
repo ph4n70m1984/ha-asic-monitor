@@ -67,7 +67,7 @@ class AsicDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 				_LOGGER.warning("Could not set executable permissions on %s: %s", self.bin_path, err)
 
 	async def _run_cmd(self, *args: str) -> str:
-		"""Запуск вспомогательного бинарника."""
+		"""Запуск вспомогательного бинарника с логированием в журнал HA."""
 		if not os.path.isfile(self.bin_path):
 			raise UpdateFailed(f"Scanner binary missing at: {self.bin_path}")
 
@@ -78,10 +78,20 @@ class AsicDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 			stderr=asyncio.subprocess.PIPE,
 		)
 		stdout, stderr = await proc.communicate()
-		if proc.returncode != 0:
-			raise UpdateFailed(f"Scanner error: {stderr.decode().strip()}")
-		return stdout.decode().strip()
+		
+		# Логируем stderr бинарника в журнал Home Assistant
+		err_output = stderr.decode(errors="replace").strip()
+		if err_output:
+			for line in err_output.splitlines():
+				_LOGGER.debug("[GoScanner] %s", line)
 
+		if proc.returncode != 0:
+			_LOGGER.error("Scanner failed (code %s): %s", proc.returncode, err_output)
+			raise UpdateFailed(f"Scanner error: {err_output}")
+
+		return stdout.decode(errors="replace").strip()
+
+	
 	async def _scan_subnets(self) -> None:
 		"""Поиск активных IP в подсетях."""
 		try:
