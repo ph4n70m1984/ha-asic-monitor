@@ -60,7 +60,6 @@ class AsicDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 			self.bin_path = os.path.join(bin_dir, "asic_scanner_amd64")
 			_LOGGER.error("ASIC Monitor: executable not found in %s", bin_dir)
 		else:
-			# Выставляем права на исполнение (chmod +x)
 			try:
 				st = os.stat(self.bin_path)
 				os.chmod(self.bin_path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
@@ -89,9 +88,9 @@ class AsicDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 			raw = await self._run_cmd("-cmd", "scan", "-target", self.subnets)
 			ips = json.loads(raw) or []
 			self.known_ips.update(ips)
-			_LOGGER.info("ASIC Monitor: found active IPs: %s", self.known_ips)
+			_LOGGER.info("ASIC Monitor [%s]: found active IPs: %s", self.subnets, self.known_ips)
 		except Exception as err:
-			_LOGGER.error("Error during subnet scan: %s", err)
+			_LOGGER.error("Error during subnet scan [%s]: %s", self.subnets, err)
 
 	async def async_restart_miner(self, ip: str) -> None:
 		"""Отправка команды перезагрузки с авторизацией."""
@@ -101,6 +100,26 @@ class AsicDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 			"-user", self.username,
 			"-pass", self.password,
 		)
+
+	async def async_pause_miner(self, ip: str) -> None:
+		"""Остановка (пауза) майнинга."""
+		await self._run_cmd(
+			"-cmd", "pause",
+			"-target", ip,
+			"-user", self.username,
+			"-pass", self.password,
+		)
+		await self.async_request_refresh()
+
+	async def async_resume_miner(self, ip: str) -> None:
+		"""Запуск (возобновление) майнинга."""
+		await self._run_cmd(
+			"-cmd", "resume",
+			"-target", ip,
+			"-user", self.username,
+			"-pass", self.password,
+		)
+		await self.async_request_refresh()
 
 	async def _async_update_data(self) -> dict[str, Any]:
 		"""Периодический опрос телеметрии."""
@@ -124,7 +143,6 @@ class AsicDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 			except Exception as err:
 				_LOGGER.debug("Miner at %s unreachable: %s", ip, err)
 
-		# Параллельный опрос всех найденных майнеров
 		if self.known_ips:
 			await asyncio.gather(*[poll_one(ip) for ip in self.known_ips])
 

@@ -1,0 +1,76 @@
+"""Switch platform for ASIC Monitor."""
+from __future__ import annotations
+
+from typing import Any
+from homeassistant.components.switch import SwitchEntity
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+
+from .const import DOMAIN
+from .coordinator import AsicDataCoordinator
+
+async def async_setup_entry(
+	hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+) -> None:
+	"""Настройка переключателей."""
+	coordinator: AsicDataCoordinator = hass.data[DOMAIN][entry.entry_id]
+	known_devices: set[str] = set()
+
+	def check_and_add():
+		new_entities = []
+		for ip in coordinator.data:
+			if ip not in known_devices:
+				known_devices.add(ip)
+				new_entities.append(AsicMiningSwitch(coordinator, ip))
+		if new_entities:
+			async_add_entities(new_entities)
+
+	coordinator.async_add_listener(check_and_add)
+	check_and_add()
+
+class AsicMiningSwitch(CoordinatorEntity[AsicDataCoordinator], SwitchEntity):
+	"""Переключатель работы майнера (Start / Stop)."""
+
+	_attr_has_entity_name = True
+	_attr_name = "Mining"
+	_attr_icon = "mdi:pickaxe"
+
+	def __init__(self, coordinator: AsicDataCoordinator, ip: str) -> None:
+		super().__init__(coordinator)
+		self.ip = ip
+		raw_ip = ip.replace(".", "_")
+		self._attr_unique_id = f"{raw_ip}_mining_switch"
+
+	@property
+	def device_info(self):
+		data = self.coordinator.data.get(self.ip, {})
+		return {
+			"identifiers": {(DOMAIN, self.ip)},
+			"name": f"ASIC {self.ip}",
+			"manufacturer": data.get("make", "ASIC"),
+			"model": data.get("model", "Miner"),
+			"sw_version": data.get("firmware"),
+		}
+
+	@property
+	def available(self) -> bool:
+		return self.ip in self.coordinator.data
+
+	@property
+	def is_on(self) -> bool:
+		data = self.coordinator.data.get(self.ip)
+		if not data:
+			return False
+		if data.get("hashrate_th", 0) > 0.1:
+			return True
+		return bool(data.get("is_mining", False))
+
+	async def async_turn_on(self, **kwargs: Any) -> None:
+		"""Запуск майнинга."""
+		await self.coordinator.async_resume_miner(self.ip)
+
+	async def async_turn_off(self, **kwargs: Any) -> None:
+		"""Остановка (пауза) майнинга."""
+		await self.coordinator.async_pause_miner(self.ip)

@@ -5,7 +5,11 @@ DOMAIN = "asic_monitor"
 CONF_SUBNETS = "subnets"
 CONF_SCAN_INTERVAL = "scan_interval"
 CONF_POLL_INTERVAL = "poll_interval"
+CONF_USERNAME = "username"
+CONF_PASSWORD = "password"
 
 DEFAULT_SUBNETS = "192.168.1.0/24"
 DEFAULT_SCAN_INTERVAL = 900  # 15 минут в секундах
 DEFAULT_POLL_INTERVAL = 20   # 20 секунд
+DEFAULT_USERNAME = "root"
+DEFAULT_PASSWORD = "admin"

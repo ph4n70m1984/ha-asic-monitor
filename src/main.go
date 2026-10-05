@@ -31,8 +31,8 @@ func getEnv(key, fallback string) string {
 }
 
 func main() {
-	cmd := flag.String("cmd", "poll", "Action: scan, poll, restart")
-	target := flag.String("target", "", "IP for poll/restart, or comma-separated subnets for scan")
+	cmd := flag.String("cmd", "poll", "Action: scan, poll, restart, pause, resume")
+	target := flag.String("target", "", "IP for poll/restart/pause/resume, or subnets for scan")
 	user := flag.String("user", getEnv("ASIC_USER", "root"), "Miner RPC username")
 	pass := flag.String("pass", getEnv("ASIC_PASS", "admin"), "Miner RPC password")
 	flag.Parse()
@@ -74,7 +74,6 @@ func main() {
 		}
 		defer miner.Close()
 
-		// Авторизация для прошивок VNish / Braiins / Stock
 		if *user != "" && *pass != "" {
 			_ = miner.SetAuth(*user, *pass)
 		}
@@ -87,7 +86,6 @@ func main() {
 		hashrate, _ := data.HashrateTH()
 		caps, _ := miner.Supports()
 
-		// Поиск максимальной температуры среди чипов
 		var maxTemp *float64
 		for _, b := range data.Hashboards {
 			for _, chip := range b.Chips {
@@ -105,7 +103,6 @@ func main() {
 			maxTemp = &val
 		}
 
-		// Корректное чтение пулов
 		var poolURL, poolUser string
 		pools, err := miner.GetPools()
 		if err == nil && len(pools) > 0 {
@@ -150,6 +147,32 @@ func main() {
 				_ = miner.SetAuth(*user, *pass)
 			}
 			_, _ = miner.Restart()
+			miner.Close()
+		}
+
+	case "pause":
+		f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(8)
+		defer f.Close()
+
+		miner, err := f.GetMiner(*target)
+		if err == nil {
+			if *user != "" && *pass != "" {
+				_ = miner.SetAuth(*user, *pass)
+			}
+			_, _ = miner.Pause(nil)
+			miner.Close()
+		}
+
+	case "resume":
+		f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(8)
+		defer f.Close()
+
+		miner, err := f.GetMiner(*target)
+		if err == nil {
+			if *user != "" && *pass != "" {
+				_ = miner.SetAuth(*user, *pass)
+			}
+			_, _ = miner.Resume(nil)
 			miner.Close()
 		}
 	}
