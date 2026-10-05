@@ -73,14 +73,11 @@ class AsicMonitorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 		config_entry: config_entries.ConfigEntry,
 	) -> config_entries.OptionsFlow:
 		"""Создание меню параметров 'Настроить'."""
-		return AsicMonitorOptionsFlow(config_entry)
+		return AsicMonitorOptionsFlow()
 
 
 class AsicMonitorOptionsFlow(config_entries.OptionsFlow):
 	"""Управление параметрами добавленной подсети."""
-
-	def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-		self.config_entry = config_entry
 
 	async def async_step_init(
 		self, user_input: dict[str, Any] | None = None
@@ -89,9 +86,9 @@ class AsicMonitorOptionsFlow(config_entries.OptionsFlow):
 		if user_input is not None:
 			return self.async_create_entry(title="", data=user_input)
 
+		# config_entry доступен как свойство базового класса
 		current = {**self.config_entry.data, **self.config_entry.options}
 
-		# Безопасное извлечение с гарантией от None
 		subnets = current.get(CONF_SUBNETS) or DEFAULT_SUBNETS
 		username = current.get(CONF_USERNAME) or DEFAULT_USERNAME
 		password = current.get(CONF_PASSWORD) or DEFAULT_PASSWORD
