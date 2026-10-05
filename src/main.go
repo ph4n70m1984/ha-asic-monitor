@@ -3,7 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/sha256"
-	"encoding/hex"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -29,12 +29,6 @@ type Output struct {
 	CanRestart  bool     `json:"can_restart"`
 }
 
-type TokenResp struct {
-	STATUS string `json:"STATUS"`
-	Msg    string `json:"Msg"`
-	Code   int    `json:"Code"`
-}
-
 func getEnv(key, fallback string) string {
 	if val := os.Getenv(key); val != "" {
 		return val
@@ -42,101 +36,157 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-func sha256Hex(s string) string {
-	h := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(h[:])
-}
-
-// sendPrivilegedWhatsminerCmd выполняет авторизацию через get_token и отправляет привилегированную команду
-func sendPrivilegedWhatsminerCmd(ip, user, password, cmd string) error {
-	addr := net.JoinHostPort(ip, "4028")
-	conn, err := net.DialTimeout("tcp", addr, 4*time.Second)
+// executeWhatsminerTCP отправляет JSON команду на сокет 4028 и возвращает сырой ответ
+func executeWhatsminerTCP(ip string, reqBytes []byte) ([]byte, error) {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, "4028"), 4*time.Second)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[WM-RPC] Connect error to %s: %v\n", addr, err)
-		return err
+		return nil, fmt.Errorf("соединение с %s:4028: %w", ip, err)
 	}
 	defer conn.Close()
 
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	reader := bufio.NewReader(conn)
 
-	// Шаг 1: Запрашиваем токен
-	if _, err := conn.Write([]byte(`{"cmd":"get_token"}` + "\n")); err != nil {
-		fmt.Fprintf(os.Stderr, "[WM-RPC] Failed to request token: %v\n", err)
-		return err
-	}
-
-	line, err := reader.ReadBytes('\x00')
-	if err != nil {
-		line, err = reader.ReadBytes('\n')
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[WM-RPC] Failed to read token: %v\n", err)
-			return err
-		}
-	}
-
-	cleanLine := strings.TrimRight(string(line), "\x00\r\n")
-	var tResp TokenResp
-	if err := json.Unmarshal([]byte(cleanLine), &tResp); err != nil {
-		fmt.Fprintf(os.Stderr, "[WM-RPC] Token parse error: %v (raw: %s)\n", err, cleanLine)
-		return err
-	}
-
-	token := tResp.Msg
-	if token == "" || tResp.STATUS != "S" {
-		fmt.Fprintf(os.Stderr, "[WM-RPC] Invalid token response: %s\n", cleanLine)
-		return fmt.Errorf("token rejected: %s", cleanLine)
-	}
-
-	fmt.Fprintf(os.Stderr, "[WM-RPC] Received token: %s\n", token)
-
-	// Варианты подписей, встречающиеся в прошивках WhatsMiner:
-	// 1) sha256(password + token)
-	// 2) sha256(admin + password + token)
-	// 3) sha256(admin + ":" + password + ":" + token)
-	candidates := []struct {
-		desc string
-		sign string
-	}{
-		{"sha256(password+token)", sha256Hex(password + token)},
-		{"sha256(user+password+token)", sha256Hex(user + password + token)},
-		{"sha256(admin+password+token)", sha256Hex("admin" + password + token)},
-		{"sha256(admin:password:token)", sha256Hex("admin:" + password + ":" + token)},
-	}
-
-	for _, cand := range candidates {
-		// Формируем запрос
-		req := map[string]interface{}{
-			"cmd":   cmd,
-			"token": token,
-			"sign":  cand.sign,
-		}
-		reqBytes, _ := json.Marshal(req)
+	if !strings.HasSuffix(string(reqBytes), "\n") {
 		reqBytes = append(reqBytes, '\n')
+	}
 
-		if _, err := conn.Write(reqBytes); err != nil {
-			fmt.Fprintf(os.Stderr, "[WM-RPC] Write error: %v\n", err)
-			return err
+	if _, err := conn.Write(reqBytes); err != nil {
+		return nil, fmt.Errorf("ошибка отправки данных: %w", err)
+	}
+
+	resp, err := reader.ReadBytes('\x00')
+	if err != nil {
+		resp, err = reader.ReadBytes('\n')
+	}
+	return resp, err
+}
+
+// getSalt запрашивает salt через get.device.info
+func getSalt(ip string) (string, error) {
+	req := `{"cmd":"get.device.info"}`
+	respBytes, err := executeWhatsminerTCP(ip, []byte(req))
+	if err != nil {
+		return "", err
+	}
+
+	cleanResp := strings.TrimRight(string(respBytes), "\x00\r\n")
+	var res map[string]interface{}
+	if err := json.Unmarshal([]byte(cleanResp), &res); err != nil {
+		return "", fmt.Errorf("ошибка парсинга get.device.info: %w (ответ: %s)", err, cleanResp)
+	}
+
+	// Поиск salt в структуре ответа
+	if msg, ok := res["msg"].(map[string]interface{}); ok {
+		if s, ok := msg["salt"].(string); ok && s != "" {
+			return s, nil
+		}
+	}
+	if s, ok := res["salt"].(string); ok && s != "" {
+		return s, nil
+	}
+
+	return "", fmt.Errorf("в ответе get.device.info нет поля salt: %s", cleanResp)
+}
+
+// generateToken вычисляет токен по спецификации MicroBT:
+// Base64(SHA256(cmd + password + salt + timestamp))[:8]
+func generateToken(cmd, password, salt string, ts int64) string {
+	payload := fmt.Sprintf("%s%s%s%d", cmd, password, salt, ts)
+	hash := sha256.Sum256([]byte(payload))
+	b64 := base64.StdEncoding.EncodeToString(hash[:])
+	if len(b64) >= 8 {
+		return b64[:8]
+	}
+	return b64
+}
+
+// sendWhatsminerModernCmd отправляет привилегированные команды с токеном
+func sendWhatsminerModernCmd(ip, user, password, action string) error {
+	fmt.Fprintf(os.Stderr, "[WM-V4] Запрос salt у %s...\n", ip)
+	salt, err := getSalt(ip)
+	if err != nil {
+		return fmt.Errorf("не удалось получить salt: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "[WM-V4] Получен salt: %s\n", salt)
+
+	var targetCmds []struct {
+		cmd   string
+		param interface{}
+	}
+
+	if action == "power_off" {
+		targetCmds = []struct {
+			cmd   string
+			param interface{}
+		}{
+			{"set.miner.power", "off"},
+			{"set.power_off", nil},
+			{"set.miner.power_off", nil},
+		}
+	} else if action == "resume" {
+		targetCmds = []struct {
+			cmd   string
+			param interface{}
+		}{
+			{"set.miner.power", "on"},
+			{"set.miner.power_on", nil},
+			{"set.miner.restart", nil},
+		}
+	} else { // restart
+		targetCmds = []struct {
+			cmd   string
+			param interface{}
+		}{
+			{"set.miner.restart", nil},
+			{"set.system.reboot", nil},
+		}
+	}
+
+	account := user
+	if account == "" || account == "root" {
+		account = "admin"
+	}
+
+	for _, tc := range targetCmds {
+		ts := time.Now().Unix()
+		token := generateToken(tc.cmd, password, salt, ts)
+
+		reqMap := map[string]interface{}{
+			"cmd":     tc.cmd,
+			"account": account,
+			"ts":      ts,
+			"token":   token,
+		}
+		if tc.param != nil {
+			reqMap["param"] = tc.param
 		}
 
-		respLine, err := reader.ReadBytes('\n')
-		if err != nil && len(respLine) == 0 {
-			respLine, err = reader.ReadBytes('\x00')
+		reqBytes, _ := json.Marshal(reqMap)
+		fmt.Fprintf(os.Stderr, "[WM-V4] Отправка команды: %s\n", string(reqBytes))
+
+		respBytes, err := executeWhatsminerTCP(ip, reqBytes)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[WM-V4] Ошибка сети: %v\n", err)
+			continue
 		}
 
-		respStr := strings.TrimRight(string(respLine), "\x00\r\n")
-		fmt.Fprintf(os.Stderr, "[WM-RPC] Try %s -> Response: %s\n", cand.desc, respStr)
+		respStr := strings.TrimRight(string(respBytes), "\x00\r\n")
+		fmt.Fprintf(os.Stderr, "[WM-V4] Ответ майнера: %s\n", respStr)
 
 		var res map[string]interface{}
 		if err := json.Unmarshal([]byte(respStr), &res); err == nil {
-			if status, ok := res["STATUS"].(string); ok && status == "S" {
-				fmt.Fprintf(os.Stderr, "[WM-RPC] Command '%s' SUCCESS!\n", cmd)
+			status, _ := res["status"].(string)
+			code, _ := res["code"].(float64)
+			msg, _ := res["msg"].(string)
+			if strings.EqualFold(status, "success") || strings.EqualFold(status, "s") || code == 0 || strings.Contains(strings.ToLower(msg), "success") {
+				fmt.Fprintf(os.Stderr, "[WM-V4] Команда '%s' успешно выполнена!\n", tc.cmd)
 				return nil
 			}
 		}
 	}
 
-	return fmt.Errorf("all auth attempts rejected by %s", ip)
+	return fmt.Errorf("майнер не подтвердил выполнение команды %s", action)
 }
 
 func main() {
@@ -247,26 +297,33 @@ func main() {
 		_ = json.NewEncoder(os.Stdout).Encode(out)
 
 	case "restart":
-		f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(8)
-		defer f.Close()
-
+		f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(5)
 		miner, err := f.GetMiner(*target)
+		f.Close()
+
+		handled := false
 		if err == nil {
 			if *user != "" && *pass != "" {
 				_ = miner.SetAuth(*user, *pass)
 			}
-			_, _ = miner.Restart()
+			ok, _ := miner.Restart()
+			handled = ok
 			miner.Close()
-		} else {
-			_ = sendPrivilegedWhatsminerCmd(*target, *user, *pass, "restart")
+		}
+
+		if !handled {
+			if err := sendWhatsminerModernCmd(*target, *user, *pass, "restart"); err != nil {
+				fmt.Fprintf(os.Stderr, "[ERROR] %v\n", err)
+				os.Exit(1)
+			}
 		}
 
 	case "pause":
-		// Пробуем через FFI asic-rs
-		f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(8)
-		defer f.Close()
-
+		// Сначала проверяем FFI
+		f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(5)
 		miner, err := f.GetMiner(*target)
+		f.Close()
+
 		handled := false
 		if err == nil {
 			if *user != "" && *pass != "" {
@@ -277,16 +334,19 @@ func main() {
 			miner.Close()
 		}
 
-		// Если FFI Pause вернул false (WhatsMiner Stock), вызываем команду power_off
+		// Для стока WhatsMiner переходим на солевой API MicroBT
 		if !handled {
-			_ = sendPrivilegedWhatsminerCmd(*target, *user, *pass, "power_off")
+			if err := sendWhatsminerModernCmd(*target, *user, *pass, "power_off"); err != nil {
+				fmt.Fprintf(os.Stderr, "[ERROR] %v\n", err)
+				os.Exit(1)
+			}
 		}
 
 	case "resume":
-		f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(8)
-		defer f.Close()
-
+		f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(5)
 		miner, err := f.GetMiner(*target)
+		f.Close()
+
 		handled := false
 		if err == nil {
 			if *user != "" && *pass != "" {
@@ -297,9 +357,11 @@ func main() {
 			miner.Close()
 		}
 
-		// Для возобновления на стоке WhatsMiner используется команда restart майнинг-демона
 		if !handled {
-			_ = sendPrivilegedWhatsminerCmd(*target, *user, *pass, "restart")
+			if err := sendWhatsminerModernCmd(*target, *user, *pass, "resume"); err != nil {
+				fmt.Fprintf(os.Stderr, "[ERROR] %v\n", err)
+				os.Exit(1)
+			}
 		}
 	}
 }
