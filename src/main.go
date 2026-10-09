@@ -30,6 +30,8 @@ type Output struct {
 	PoolURL     string   `json:"pool_url,omitempty"`
 	PoolUser    string   `json:"pool_user,omitempty"`
 	CanRestart  bool     `json:"can_restart"`
+	CanPause    bool     `json:"can_pause"`
+	CanResume   bool     `json:"can_resume"`
 }
 
 func getEnv(key, fallback string) string {
@@ -134,7 +136,7 @@ func tryAsicRsFFI(ip, user, pass, action string) bool {
 	f := asic_go.NewMinerFactory().WithIdentificationTimeoutSecs(5)
 	defer f.Close()
 
-	// Пробуем: 1) с пользователем из HA, 2) с аккаунтом "super" (стандарт WhatsMiner V3 в asic-rs)
+	// 1) с пользователем из HA, 2) super с паролем из HA, 3) дефолтный super:super, 4) дефолтный admin:admin
 	authPairs := []struct{ u, p string }{
 		{user, pass},
 		{"super", pass},
@@ -182,7 +184,6 @@ func executeWhatsminerV3Direct(ip, user, password, action string) error {
 
 	cmdName := "set.miner.service"
 
-	// В asic-rs указано: if issues are found with "stop"/"start", switch to "disable"/"enable"
 	var paramsToTry []string
 	if action == "stop" {
 		paramsToTry = []string{"stop", "disable"}
@@ -199,10 +200,6 @@ func executeWhatsminerV3Direct(ip, user, password, action string) error {
 
 	for _, acc := range accounts {
 		for _, pStr := range paramsToTry {
-			// Пробуем 3 режима кодирования param:
-			// 0 = открытая строка "stop"
-			// 1 = PKCS7 AES от сырой строки "stop"
-			// 2 = PKCS7 AES от JSON-строки "\"stop\"" (как Some(json!("stop")) в asic-rs)
 			for mode := 0; mode <= 2; mode++ {
 				ts := time.Now().Unix()
 				strToHash := fmt.Sprintf("%s%s%s%d", cmdName, password, salt, ts)
@@ -217,7 +214,7 @@ func executeWhatsminerV3Direct(ip, user, password, action string) error {
 					enc, _ := aesEncryptPKCS7([]byte(pStr), sha256Data[:])
 					finalParam = base64.StdEncoding.EncodeToString(enc)
 				case 2:
-					jsonBytes, _ := json.Marshal(pStr) // "\"stop\""
+					jsonBytes, _ := json.Marshal(pStr)
 					enc, _ := aesEncryptPKCS7(jsonBytes, sha256Data[:])
 					finalParam = base64.StdEncoding.EncodeToString(enc)
 				}
@@ -355,6 +352,14 @@ func main() {
 			}
 		}
 
+		// Для WhatsMiner и моделей с FFI включаем поддержку Pause/Resume
+		canPause := caps.Pause
+		canResume := caps.Resume
+		if strings.EqualFold(data.DeviceInfo.Make, "WhatsMiner") || strings.EqualFold(data.DeviceInfo.Make, "MicroBT") {
+			canPause = true
+			canResume = true
+		}
+
 		out := Output{
 			IP:          *target,
 			Model:       data.DeviceInfo.Model,
@@ -368,6 +373,8 @@ func main() {
 			PoolURL:     poolURL,
 			PoolUser:    poolUser,
 			CanRestart:  caps.Restart,
+			CanPause:    canPause,
+			CanResume:   canResume,
 		}
 		_ = json.NewEncoder(os.Stdout).Encode(out)
 
